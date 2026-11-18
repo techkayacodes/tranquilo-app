@@ -177,6 +177,46 @@ describe("an origin that answers 200 with a non-raster type", () => {
     }
   });
 
+  it.each([
+    ["text/html", true],
+    ["application/octet-stream", true],
+    [null, false],
+  ])(
+    "never stores a corrupt PNG with an HTML tail as %s",
+    async (type, sendHeader) => {
+      const png = await sharp({
+        create: { width: 8, height: 8, channels: 3, background: "#fff" },
+      })
+        .png()
+        .toBuffer();
+      const corrupt = Buffer.concat([
+        png.subarray(0, 40),
+        Buffer.alloc(16, 0x41),
+        Buffer.from("<html><script>alert(1)</script></html>"),
+      ]);
+      origin = await startFakeOrigin(() => ({
+        status: 200,
+        headers: sendHeader ? { "content-type": String(type) } : {},
+        body: corrupt,
+      }));
+      const outcome = await proxy
+        .fetchOriginOnce(origin.url(), "met")
+        .then((out: { contentType: string }) => out.contentType)
+        .catch(() => "rejected");
+      expect(["image/png", "rejected"]).toContain(outcome);
+    },
+  );
+
+  it("normalises image/jpg to image/jpeg when sharp cannot parse the body", async () => {
+    origin = await startFakeOrigin(() => ({
+      status: 200,
+      headers: { "content-type": "image/jpg" },
+      body: JPEG,
+    }));
+    const out = await proxy.fetchOriginOnce(origin.url(), "met");
+    expect(out.contentType).toBe("image/jpeg");
+  });
+
   it("rejects a real SVG regardless of the declared type", async () => {
     origin = await startFakeOrigin(() => ({
       status: 200,
@@ -247,6 +287,39 @@ describe("origin redirects", () => {
     ).rejects.toThrow(/redirect refused/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ redirect: "manual" });
+  });
+
+  it.each([
+    "https://www.artic.edu:8443/a.jpg",
+    "https://user:pw@www.artic.edu/a.jpg",
+  ])("refuses a same-host redirect to %s", async (target) => {
+    vi.stubGlobal("fetch", redirectTo(target));
+    await expect(
+      proxy.fetchOriginOnce("https://www.artic.edu/a.jpg", "aic"),
+    ).rejects.toThrow(/redirect refused/);
+  });
+
+  it("cancels the body of a redirect response it does not read", async () => {
+    let cancelled = false;
+    const body = new ReadableStream({
+      cancel() {
+        cancelled = true;
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(body, {
+            status: 302,
+            headers: { location: "https://evil.example/a.jpg" },
+          }),
+      ),
+    );
+    await expect(
+      proxy.fetchOriginOnce("https://images.metmuseum.org/a.jpg", "met"),
+    ).rejects.toThrow(/redirect refused/);
+    expect(cancelled).toBe(true);
   });
 
   it("refuses a redirect off the source's allowlisted hosts", async () => {

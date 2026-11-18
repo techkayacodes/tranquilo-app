@@ -192,8 +192,7 @@ const WILDCARD_DNS_SUFFIX =
   /\.(nip\.io|sslip\.io|xip\.io|traefik\.me|localtest\.me)$/;
 const EMBEDDED_IPV4 = /(^|[.-])\d{1,3}([.-])\d{1,3}\2\d{1,3}\2\d{1,3}([.-]|$)/;
 
-// IP literals, internal names, wildcard-DNS names, ports and credentials are
-// never a contributing institution's image host.
+// Rejects IP literals, internal and wildcard-DNS names, ports, credentials.
 function isPublicDnsHost(url: URL): boolean {
   const host = url.hostname.replace(/\.+$/, "");
   if (url.port || url.username || url.password) return false;
@@ -217,6 +216,7 @@ function isAllowedOrigin(
     return false;
   }
   if (parsed.protocol !== "https:") return false;
+  if (parsed.port || parsed.username || parsed.password) return false;
   if (source === "europeana" && tier === "lightbox")
     return isPublicDnsHost(parsed);
   if (!isImgSource(source)) return false;
@@ -267,52 +267,60 @@ function tooLargeError(bytes: number) {
   return err;
 }
 
-const RASTER_FORMATS = new Set(["jpeg", "png", "webp", "gif", "heif", "tiff"]);
-const RASTER_CONTENT_TYPES = new Set([
-  "image/jpeg",
-  "image/jpg",
-  "image/pjpeg",
-  "image/png",
-  "image/webp",
-  "image/avif",
-  "image/gif",
-  "image/tiff",
-]);
+const FORMAT_CONTENT_TYPES: Record<string, string> = {
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif",
+  tiff: "image/tiff",
+};
+const HEADER_CONTENT_TYPES: Record<string, string> = {
+  "image/jpeg": "image/jpeg",
+  "image/jpg": "image/jpeg",
+  "image/pjpeg": "image/jpeg",
+  "image/png": "image/png",
+  "image/webp": "image/webp",
+  "image/avif": "image/avif",
+  "image/gif": "image/gif",
+  "image/tiff": "image/tiff",
+};
 const MAX_ORIGIN_REDIRECTS = 3;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-function hasRasterSignature(buf: Buffer): boolean {
+function sniffContentType(buf: Buffer): string | null {
   const ascii = (from: number, to: number) =>
     buf.subarray(from, to).toString("latin1");
-  return (
-    (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) ||
-    (buf[0] === 0x89 && ascii(1, 4) === "PNG") ||
-    ascii(0, 3) === "GIF" ||
-    (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") ||
-    (ascii(4, 8) === "ftyp" && /^(avif|avis)/.test(ascii(8, 12))) ||
-    ascii(0, 4) === "II*\u0000" ||
-    ascii(0, 4) === "MM\u0000*"
-  );
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+    return "image/jpeg";
+  if (buf[0] === 0x89 && ascii(1, 4) === "PNG") return "image/png";
+  if (ascii(0, 3) === "GIF") return "image/gif";
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return "image/webp";
+  if (ascii(4, 8) === "ftyp" && /^(avif|avis)/.test(ascii(8, 12)))
+    return "image/avif";
+  if (ascii(0, 4) === "II*\u0000" || ascii(0, 4) === "MM\u0000*")
+    return "image/tiff";
+  return null;
 }
 
 function looksLikeMarkup(buf: Buffer): boolean {
   return buf.subarray(0, 512).toString("utf8").trimStart().startsWith("<");
 }
 
-// sharp renders SVG whatever the header claims, so the format sharp detects
-// in the body decides; the header only covers bodies sharp cannot parse.
-async function isAcceptedRaster(
+// Content type from the body's detected format, never the origin's header.
+async function detectRasterContentType(
   declaredContentType: string | null,
   buf: Buffer,
-): Promise<boolean> {
-  if (looksLikeMarkup(buf)) return false;
+): Promise<string | null> {
+  if (looksLikeMarkup(buf)) return null;
   try {
-    const { format } = await sharp(buf).metadata();
-    return format !== undefined && RASTER_FORMATS.has(format);
+    const { format, compression } = await sharp(buf).metadata();
+    if (format === "heif")
+      return compression === "av1" ? "image/avif" : "image/heif";
+    return (format && FORMAT_CONTENT_TYPES[format]) || null;
   } catch (_e) {
-    if (!declaredContentType) return hasRasterSignature(buf);
+    if (!declaredContentType) return sniffContentType(buf);
     const mime = declaredContentType.split(";")[0].trim().toLowerCase();
-    return RASTER_CONTENT_TYPES.has(mime);
+    return HEADER_CONTENT_TYPES[mime] ?? null;
   }
 }
 
@@ -340,6 +348,7 @@ async function fetchOriginOnce(
       });
       if (!REDIRECT_STATUSES.has(r.status)) break;
       const location = r.headers.get("location");
+      await r.body?.cancel();
       if (!location) throw redirectRefused("no location");
       if (hop >= MAX_ORIGIN_REDIRECTS) throw redirectRefused("too many hops");
       const next = new URL(location, current).toString();
@@ -383,14 +392,14 @@ async function fetchOriginOnce(
     // asset request with 200 and an HTML error page as the body. Without
     // this, that HTML would sail through sharp's decode failure path and
     // get stored verbatim as if it were the image.
-    if (!(await isAcceptedRaster(declaredContentType, buf))) {
+    const contentType = await detectRasterContentType(declaredContentType, buf);
+    if (!contentType) {
       const typeErr: OriginError = new Error(
         `origin returned a 200 that is not a raster image (${declaredContentType ?? "no content-type"})`,
       );
       typeErr.status = r.status;
       throw typeErr;
     }
-    const contentType = declaredContentType || "application/octet-stream";
     return { buf: buf, contentType: contentType };
   } finally {
     clearTimeout(timeout);

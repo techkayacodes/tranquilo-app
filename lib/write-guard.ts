@@ -1,5 +1,4 @@
-// Size, shape and rate guards shared by the unauthenticated write routes
-// (api/track.ts, api/subscribe.ts, api/submit-collection.ts).
+// Size, shape and rate guards for unauthenticated write routes.
 import type { QuerySql } from "./img-store.ts";
 import { writeRateLimitOrRespond } from "./items-rate-limit.ts";
 
