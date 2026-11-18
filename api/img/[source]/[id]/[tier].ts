@@ -188,15 +188,20 @@ function isImgSource(value: unknown): value is ImgSource {
   );
 }
 
-// IP literals, internal single-label names, ports and credentials are never
-// a contributing institution's image host.
+const WILDCARD_DNS_SUFFIX =
+  /\.(nip\.io|sslip\.io|xip\.io|traefik\.me|localtest\.me)$/;
+const EMBEDDED_IPV4 = /(^|[.-])\d{1,3}([.-])\d{1,3}\2\d{1,3}\2\d{1,3}([.-]|$)/;
+
+// IP literals, internal names, wildcard-DNS names, ports and credentials are
+// never a contributing institution's image host.
 function isPublicDnsHost(url: URL): boolean {
-  const host = url.hostname;
+  const host = url.hostname.replace(/\.+$/, "");
   if (url.port || url.username || url.password) return false;
   if (host.includes(":") || /^[0-9.]+$/.test(host) || /^\[/.test(host))
     return false;
   if (host === "localhost" || host.endsWith(".localhost")) return false;
   if (/\.(internal|local|localdomain|lan|home|corp)$/.test(host)) return false;
+  if (WILDCARD_DNS_SUFFIX.test(host) || EMBEDDED_IPV4.test(host)) return false;
   return host.includes(".");
 }
 
@@ -262,13 +267,19 @@ function tooLargeError(bytes: number) {
   return err;
 }
 
+const RASTER_FORMATS = new Set(["jpeg", "png", "webp", "gif", "heif", "tiff"]);
 const RASTER_CONTENT_TYPES = new Set([
   "image/jpeg",
+  "image/jpg",
+  "image/pjpeg",
   "image/png",
   "image/webp",
   "image/avif",
   "image/gif",
+  "image/tiff",
 ]);
+const MAX_ORIGIN_REDIRECTS = 3;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function hasRasterSignature(buf: Buffer): boolean {
   const ascii = (from: number, to: number) =>
@@ -278,7 +289,9 @@ function hasRasterSignature(buf: Buffer): boolean {
     (buf[0] === 0x89 && ascii(1, 4) === "PNG") ||
     ascii(0, 3) === "GIF" ||
     (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") ||
-    (ascii(4, 8) === "ftyp" && /^(avif|avis)/.test(ascii(8, 12)))
+    (ascii(4, 8) === "ftyp" && /^(avif|avis)/.test(ascii(8, 12))) ||
+    ascii(0, 4) === "II*\u0000" ||
+    ascii(0, 4) === "MM\u0000*"
   );
 }
 
@@ -286,30 +299,55 @@ function looksLikeMarkup(buf: Buffer): boolean {
   return buf.subarray(0, 512).toString("utf8").trimStart().startsWith("<");
 }
 
-// sharp renders SVG whatever the header claims, so the body is checked too.
-function isAcceptedRaster(
+// sharp renders SVG whatever the header claims, so the format sharp detects
+// in the body decides; the header only covers bodies sharp cannot parse.
+async function isAcceptedRaster(
   declaredContentType: string | null,
   buf: Buffer,
-): boolean {
+): Promise<boolean> {
   if (looksLikeMarkup(buf)) return false;
-  if (!declaredContentType) return hasRasterSignature(buf);
-  const mime = declaredContentType.split(";")[0].trim().toLowerCase();
-  return RASTER_CONTENT_TYPES.has(mime);
+  try {
+    const { format } = await sharp(buf).metadata();
+    return format !== undefined && RASTER_FORMATS.has(format);
+  } catch (_e) {
+    if (!declaredContentType) return hasRasterSignature(buf);
+    const mime = declaredContentType.split(";")[0].trim().toLowerCase();
+    return RASTER_CONTENT_TYPES.has(mime);
+  }
+}
+
+function redirectRefused(reason: string): OriginError {
+  return new Error(`origin redirect refused: ${reason}`);
 }
 
 async function fetchOriginOnce(
   url: string,
   source: string,
+  tier: ImgTier = "display",
 ): Promise<{ buf: Buffer; contentType: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => {
     controller.abort();
   }, ORIGIN_FETCH_TIMEOUT_MS);
   try {
-    const r = await fetch(url, {
-      signal: controller.signal,
-      headers: identity.imageFetchHeaders(source),
-    });
+    let current = url;
+    let r: Response;
+    for (let hop = 0; ; hop++) {
+      r = await fetch(current, {
+        signal: controller.signal,
+        headers: identity.imageFetchHeaders(source),
+        redirect: "manual",
+      });
+      if (!REDIRECT_STATUSES.has(r.status)) break;
+      const location = r.headers.get("location");
+      if (!location) throw redirectRefused("no location");
+      if (hop >= MAX_ORIGIN_REDIRECTS) throw redirectRefused("too many hops");
+      const next = new URL(location, current).toString();
+      if (!next.startsWith("https:")) throw redirectRefused("not https");
+      if (!isAllowedOrigin(source, tier, next))
+        throw redirectRefused("disallowed host");
+      current = next;
+    }
     if (!r.ok) {
       const err: OriginError = new Error(
         `origin fetch failed with status ${r.status}`,
@@ -345,7 +383,7 @@ async function fetchOriginOnce(
     // asset request with 200 and an HTML error page as the body. Without
     // this, that HTML would sail through sharp's decode failure path and
     // get stored verbatim as if it were the image.
-    if (!isAcceptedRaster(declaredContentType, buf)) {
+    if (!(await isAcceptedRaster(declaredContentType, buf))) {
       const typeErr: OriginError = new Error(
         `origin returned a 200 that is not a raster image (${declaredContentType ?? "no content-type"})`,
       );
@@ -402,8 +440,8 @@ async function alertOnce(
 
 // Single attempt -- see ORIGIN_COOLDOWN_DEFAULT_SECONDS above for why
 // there's no retry loop.
-async function fetchOrigin(url: string, source: string) {
-  return await fetchOriginOnce(url, source);
+async function fetchOrigin(url: string, source: string, tier: ImgTier) {
+  return await fetchOriginOnce(url, source, tier);
 }
 
 // Circuit breaker, atomic: the UPDATE's WHERE clause only lets the
@@ -825,7 +863,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           name: "img-proxy.fetch-origin",
           attributes: { source: source, tier: tier, id: id },
         },
-        () => fetchOrigin(fetchUrl, source),
+        () => fetchOrigin(fetchUrl, source, tier),
       );
       await guard.recordOriginOutcome(sqlClient, source, 200, true);
       await guard.recordHostOutcome(sqlClient, hostOf(originUrl), 200, true);

@@ -3,11 +3,11 @@
 // language the form was sent in, so a reply can be written in it.
 // Requires RESEND_API_KEY and SUBMIT_NOTIFY_EMAIL.
 
+import { randomUUID } from "node:crypto";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getSql } from "../lib/db.ts";
 import { escapeHtml } from "../lib/html-escape.ts";
 import { isValidEmail } from "../lib/is-valid-email.ts";
-import { redactEmails } from "../lib/redact.ts";
 import { requestLocale } from "../lib/request-locale.ts";
 import { reportError, reportProblem } from "../lib/sentry.ts";
 import {
@@ -132,7 +132,8 @@ async function sendNotification(
   // malformed reply_to.
   if (replyTo) payload.reply_to = replyTo;
 
-  let resendRes: Response, errText: string;
+  const requestId = randomUUID();
+  let resendRes: Response;
   try {
     resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -144,16 +145,15 @@ async function sendNotification(
     });
 
     if (!resendRes.ok) {
-      errText = await resendRes.text();
       console.error(
         "submit-collection: Resend API error",
         resendRes.status,
-        errText,
+        requestId,
       );
       await reportProblem(
         "submit.resend_failed",
         `submit-collection: Resend refused the email (${resendRes.status})`,
-        { status: resendRes.status, body: redactEmails(errText) },
+        { status: resendRes.status, requestId },
       );
       res.statusCode = 502;
       res.json({ error: "Couldn't send the submission email" });

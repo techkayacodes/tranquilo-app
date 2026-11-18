@@ -129,12 +129,12 @@ function renderAppPage(appHtml: string, opts: PageMeta) {
       // URLs after it in document order, and index.html links
       // css/style.css inside <head>.
       .replace("<head>", '<head>\n<base href="/">')
-      .replace(/<title>[\s\S]*?<\/title>/, `<title>${opts.title}</title>`)
+      .replace(/<title>[\s\S]*?<\/title>/, () => `<title>${opts.title}</title>`)
       .replace(
         /<meta name="description" content="[^"]*">/,
-        `<meta name="description" content="${opts.description}">`,
+        () => `<meta name="description" content="${opts.description}">`,
       )
-      .replace("</head>", `${head}</head>`)
+      .replace("</head>", () => `${head}</head>`)
   );
 }
 

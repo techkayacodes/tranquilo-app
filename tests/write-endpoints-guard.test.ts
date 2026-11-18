@@ -1,3 +1,4 @@
+import type { VercelResponse } from "@vercel/node";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const sqlMock = vi.hoisted(() => ({
@@ -10,10 +11,18 @@ const { default: track } = await import("../api/track.ts");
 const { default: subscribe } = await import("../api/subscribe.ts");
 const { default: submit } = await import("../api/submit-collection.ts");
 
-function mockRes(): any {
-  return {
+interface MockRes {
+  statusCode: number;
+  body: unknown;
+  headers: Record<string, string>;
+  setHeader(k: string, v: string): void;
+  json(payload: unknown): MockRes;
+}
+
+function mockRes(): MockRes & VercelResponse {
+  const res = {
     statusCode: 0,
-    body: null,
+    body: null as unknown,
     headers: {} as Record<string, string>,
     setHeader(k: string, v: string) {
       this.headers[k] = v;
@@ -23,6 +32,7 @@ function mockRes(): any {
       return this;
     },
   };
+  return res as unknown as MockRes & VercelResponse;
 }
 
 const post = (body: unknown) =>
@@ -121,7 +131,7 @@ describe("api/subscribe", () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string, init: any) =>
+      vi.fn(async (_url: string, init?: { method?: string }) =>
         (init?.method || "GET") === "GET"
           ? { ok: false, status: 404, json: async () => ({}) }
           : {
@@ -146,6 +156,29 @@ describe("api/subscribe", () => {
 });
 
 describe("api/submit-collection", () => {
+  it("logs neither the Resend error body nor the reply-to address", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 422,
+        text: async () => "invalid reply_to victim@example.com",
+      })),
+    );
+    const res = mockRes();
+    await submit(
+      post({ kind: "feedback", message: "hi", email: "victim@example.com" }),
+      res,
+    );
+    expect(res.statusCode).toBe(502);
+    expect(JSON.stringify(errors.mock.calls)).not.toContain(
+      "victim@example.com",
+    );
+    errors.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
   it("rejects an oversized body with 413", async () => {
     const res = mockRes();
     await submit(post({ kind: "feedback", message: "x".repeat(40000) }), res);

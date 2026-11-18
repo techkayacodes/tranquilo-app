@@ -10,7 +10,8 @@
  * convenience) and response size (no guard -- unbounded by design since
  * the lightbox tier exists to resize the master).
  */
-import { afterEach, describe, expect, it } from "vitest";
+import sharp from "sharp";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as guard from "../lib/img-fetch-guard.ts";
 import * as identity from "../lib/source-identity.ts";
 import { startFakeOrigin } from "./helpers/origin.ts";
@@ -139,7 +140,6 @@ describe("an origin that answers 200 with something that is not an image", () =>
 describe("an origin that answers 200 with a non-raster type", () => {
   it.each([
     ["image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg'/>"],
-    ["image/tiff", JPEG],
     ["application/pdf", JPEG],
   ])("rejects declared %s", async (type, body) => {
     origin = await startFakeOrigin(() => ({
@@ -150,6 +150,40 @@ describe("an origin that answers 200 with a non-raster type", () => {
     await expect(
       proxy.fetchOriginOnce(origin.url(), "met"),
     ).rejects.toMatchObject({ status: 200 });
+  });
+
+  it("accepts a real TIFF, JPEG and PNG by the format in the body", async () => {
+    const raw = {
+      width: 2,
+      height: 2,
+      channels: 3 as const,
+      background: "#fff",
+    };
+    for (const [format, type] of [
+      ["tiff", "image/tiff"],
+      ["jpeg", "image/jpg"],
+      ["png", "application/octet-stream"],
+    ] as const) {
+      const body = await sharp({ create: raw }).toFormat(format).toBuffer();
+      origin = await startFakeOrigin(() => ({
+        status: 200,
+        headers: { "content-type": type },
+        body,
+      }));
+      const out = await proxy.fetchOriginOnce(origin.url(), "met");
+      expect(out.buf.length).toBe(body.length);
+      await origin.close();
+      origin = null;
+    }
+  });
+
+  it("rejects a real SVG regardless of the declared type", async () => {
+    origin = await startFakeOrigin(() => ({
+      status: 200,
+      headers: { "content-type": "image/jpeg" },
+      body: "  <svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>",
+    }));
+    await expect(proxy.fetchOriginOnce(origin.url(), "met")).rejects.toThrow();
   });
 
   it("rejects SVG markup even when it claims to be a PNG", async () => {
@@ -182,6 +216,83 @@ describe("an origin that answers 200 with a non-raster type", () => {
       expect(out.contentType).toContain(type);
     },
   );
+});
+
+describe("origin redirects", () => {
+  const redirectTo = (location: string) =>
+    vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(null, { status: 302, headers: { location } }),
+    );
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["a private address", "https://127.0.0.1/a.jpg"],
+    ["the metadata address", "https://169.254.169.254/latest/meta-data"],
+    ["a plain-http downgrade", "http://images.example-museum.nl/a.jpg"],
+    ["a trailing-dot internal host", "https://localhost./a.jpg"],
+    ["a wildcard-DNS host", "https://169.254.169.254.nip.io/a.jpg"],
+  ])("refuses a redirect to %s", async (_label, target) => {
+    const fetchMock = redirectTo(target);
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      proxy.fetchOriginOnce(
+        "https://images.example-museum.nl/start.jpg",
+        "europeana",
+        "lightbox",
+      ),
+    ).rejects.toThrow(/redirect refused/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ redirect: "manual" });
+  });
+
+  it("refuses a redirect off the source's allowlisted hosts", async () => {
+    vi.stubGlobal("fetch", redirectTo("https://evil.example/a.jpg"));
+    await expect(
+      proxy.fetchOriginOnce("https://images.metmuseum.org/a.jpg", "met"),
+    ).rejects.toThrow(/redirect refused/);
+  });
+
+  it("follows an allowed redirect and gives up after three hops", async () => {
+    const hops = vi
+      .fn<(url: string) => Promise<Response>>()
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 301,
+          headers: { location: "/b.jpg" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JPEG, {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        }),
+      );
+    vi.stubGlobal("fetch", hops);
+    const out = await proxy.fetchOriginOnce(
+      "https://images.metmuseum.org/a.jpg",
+      "met",
+    );
+    expect(out.buf.length).toBe(JPEG.length);
+    expect(hops.mock.calls[1][0]).toBe("https://images.metmuseum.org/b.jpg");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "/loop.jpg" },
+          }),
+      ),
+    );
+    await expect(
+      proxy.fetchOriginOnce("https://images.metmuseum.org/a.jpg", "met"),
+    ).rejects.toThrow(/too many hops/);
+  });
 });
 
 describe("a 429, which is the failure this whole subsystem exists for", () => {

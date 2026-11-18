@@ -71,6 +71,36 @@ describe("/v/{slug} with a malicious X-Forwarded-Host", () => {
     expect(res.body).toContain("https://tranquilo.art/discover");
   });
 
+  it("does not let $-patterns in a title splice into the app page", async () => {
+    vi.resetModules();
+    vi.stubEnv("CANONICAL_ORIGIN", "https://configured.example");
+    vi.doMock("../lib/db.ts", () => ({
+      getSql: () => ({
+        query: async () => [
+          { title: "A $` B $' C $&", artist: "x", source: "met", url: null },
+        ],
+      }),
+    }));
+    vi.doMock("node:fs", async (orig) => ({
+      ...(await orig<typeof import("node:fs")>()),
+      default: {
+        readFileSync: () =>
+          "<html><head><title>t</title></head><body>MARK</body></html>",
+      },
+    }));
+    const { default: handler } = await import("../api/v/[slug].ts");
+    const res = fakeRes();
+    await handler(
+      { headers: {}, query: { slug: "met-1" } } as never,
+      res as never,
+    );
+    expect(res.body.match(/<title>/g)).toHaveLength(1);
+    expect(res.body).toContain("<title>A $` B $&#39; C $&amp;");
+    expect(res.body.match(/MARK/g)).toHaveLength(1);
+    vi.doUnmock("../lib/db.ts");
+    vi.doUnmock("node:fs");
+  });
+
   it("escapes the slug in the canonical URL of the not-found page", async () => {
     vi.stubEnv("CANONICAL_ORIGIN", "https://configured.example");
     const res = fakeRes();

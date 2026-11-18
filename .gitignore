@@ -63,12 +63,5 @@ Temp/
 .DS_Store
 
 # cloudgear local state, backups, build output and imported IAM policies
-/.cloudgear/state.json
-/.cloudgear/state.json.bak
-/.cloudgear/state.remote.json
-/.cloudgear/state.json.pre-remote-*
-/.cloudgear/state.json.unsaved.*
-/.cloudgear/endpoints.json
-/.cloudgear/build/
-/.cloudgear/distributions/
+/.cloudgear/
 /policies/
