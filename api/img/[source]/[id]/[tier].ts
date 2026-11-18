@@ -188,6 +188,18 @@ function isImgSource(value: unknown): value is ImgSource {
   );
 }
 
+// IP literals, internal single-label names, ports and credentials are never
+// a contributing institution's image host.
+function isPublicDnsHost(url: URL): boolean {
+  const host = url.hostname;
+  if (url.port || url.username || url.password) return false;
+  if (host.includes(":") || /^[0-9.]+$/.test(host) || /^\[/.test(host))
+    return false;
+  if (host === "localhost" || host.endsWith(".localhost")) return false;
+  if (/\.(internal|local|localdomain|lan|home|corp)$/.test(host)) return false;
+  return host.includes(".");
+}
+
 function isAllowedOrigin(
   source: unknown,
   tier: ImgTier,
@@ -200,7 +212,8 @@ function isAllowedOrigin(
     return false;
   }
   if (parsed.protocol !== "https:") return false;
-  if (source === "europeana" && tier === "lightbox") return true;
+  if (source === "europeana" && tier === "lightbox")
+    return isPublicDnsHost(parsed);
   if (!isImgSource(source)) return false;
   return ALLOWED_ORIGIN_HOSTS[source].indexOf(parsed.hostname) !== -1;
 }
@@ -247,6 +260,41 @@ function tooLargeError(bytes: number) {
   );
   err.tooLarge = true;
   return err;
+}
+
+const RASTER_CONTENT_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/avif",
+  "image/gif",
+]);
+
+function hasRasterSignature(buf: Buffer): boolean {
+  const ascii = (from: number, to: number) =>
+    buf.subarray(from, to).toString("latin1");
+  return (
+    (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) ||
+    (buf[0] === 0x89 && ascii(1, 4) === "PNG") ||
+    ascii(0, 3) === "GIF" ||
+    (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") ||
+    (ascii(4, 8) === "ftyp" && /^(avif|avis)/.test(ascii(8, 12)))
+  );
+}
+
+function looksLikeMarkup(buf: Buffer): boolean {
+  return buf.subarray(0, 512).toString("utf8").trimStart().startsWith("<");
+}
+
+// sharp renders SVG whatever the header claims, so the body is checked too.
+function isAcceptedRaster(
+  declaredContentType: string | null,
+  buf: Buffer,
+): boolean {
+  if (looksLikeMarkup(buf)) return false;
+  if (!declaredContentType) return hasRasterSignature(buf);
+  const mime = declaredContentType.split(";")[0].trim().toLowerCase();
+  return RASTER_CONTENT_TYPES.has(mime);
 }
 
 async function fetchOriginOnce(
@@ -297,9 +345,9 @@ async function fetchOriginOnce(
     // asset request with 200 and an HTML error page as the body. Without
     // this, that HTML would sail through sharp's decode failure path and
     // get stored verbatim as if it were the image.
-    if (declaredContentType && !/^image\//i.test(declaredContentType)) {
+    if (!isAcceptedRaster(declaredContentType, buf)) {
       const typeErr: OriginError = new Error(
-        `origin returned a 200 with a non-image content-type (${declaredContentType})`,
+        `origin returned a 200 that is not a raster image (${declaredContentType ?? "no content-type"})`,
       );
       typeErr.status = r.status;
       throw typeErr;
@@ -460,7 +508,7 @@ async function transformForTier(
         return { buf: webpBuf, contentType: "image/webp" };
       }
     } catch (_encodeErr) {
-      // A source can serve something sharp can't decode (SVG, an exotic
+      // A source can serve something sharp can't decode (an exotic
       // TIFF) -- storing the original is correct, not a failure.
     }
     return { buf: buf, contentType: contentType };

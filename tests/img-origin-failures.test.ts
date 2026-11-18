@@ -136,6 +136,54 @@ describe("an origin that answers 200 with something that is not an image", () =>
   });
 });
 
+describe("an origin that answers 200 with a non-raster type", () => {
+  it.each([
+    ["image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg'/>"],
+    ["image/tiff", JPEG],
+    ["application/pdf", JPEG],
+  ])("rejects declared %s", async (type, body) => {
+    origin = await startFakeOrigin(() => ({
+      status: 200,
+      headers: { "content-type": type },
+      body,
+    }));
+    await expect(
+      proxy.fetchOriginOnce(origin.url(), "met"),
+    ).rejects.toMatchObject({ status: 200 });
+  });
+
+  it("rejects SVG markup even when it claims to be a PNG", async () => {
+    origin = await startFakeOrigin(() => ({
+      status: 200,
+      headers: { "content-type": "image/png" },
+      body: '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>',
+    }));
+    await expect(proxy.fetchOriginOnce(origin.url(), "met")).rejects.toThrow();
+  });
+
+  it("rejects a missing content-type when the body is not a raster", async () => {
+    origin = await startFakeOrigin(() => ({
+      status: 200,
+      headers: {},
+      body: Buffer.from("not an image at all"),
+    }));
+    await expect(proxy.fetchOriginOnce(origin.url(), "met")).rejects.toThrow();
+  });
+
+  it.each(["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"])(
+    "accepts %s",
+    async (type) => {
+      origin = await startFakeOrigin(() => ({
+        status: 200,
+        headers: { "content-type": `${type}; charset=binary` },
+        body: JPEG,
+      }));
+      const out = await proxy.fetchOriginOnce(origin.url(), "met");
+      expect(out.contentType).toContain(type);
+    },
+  );
+});
+
 describe("a 429, which is the failure this whole subsystem exists for", () => {
   it("carries Retry-After through, in seconds", async () => {
     // Used to be discarded, so the old retry loop guessed by retrying
