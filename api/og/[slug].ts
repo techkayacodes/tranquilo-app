@@ -10,7 +10,12 @@
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import type { ImageResponse as OgImageResponse } from "@vercel/og";
+import {
+  CATEGORY_COVERS,
+  categoryFromPageSlug,
+} from "../../lib/category-pages.ts";
 import { getSql } from "../../lib/db.ts";
+import { configFromEnv, resolveHit } from "../../lib/img-store.ts";
 import { rateLimitOrRespond } from "../../lib/img-visitor-rate-limit.ts";
 import { LIVE_ITEMS_AND } from "../../lib/items-sql.ts";
 import { reportError } from "../../lib/sentry.ts";
@@ -33,6 +38,7 @@ type CardFonts = NonNullable<
 
 interface ItemRow {
   source: string;
+  native_id?: string | null;
   img?: string | null;
   title?: string | null;
   artist?: string | null;
@@ -151,6 +157,18 @@ function loadFonts(): Promise<CardFonts> {
   return fontsPromise;
 }
 
+// Satori throws "not iterable" on any other data-URI type (e.g. webp);
+// those are re-encoded to JPEG at twice the card's image box.
+const CARD_IMAGE_BOX = { width: 920, height: 1004 };
+const MAX_CONVERT_PIXELS = 100_000_000;
+const SATORI_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/apng",
+  "image/jpeg",
+  "image/gif",
+  "image/svg+xml",
+]);
+
 async function fetchImageDataUri(url: string, source: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => {
@@ -165,10 +183,55 @@ async function fetchImageDataUri(url: string, source: string) {
     });
     if (!r.ok) throw new Error(`image fetch failed with status ${r.status}`);
     const buf = await r.arrayBuffer();
-    const contentType = r.headers.get("content-type") || "image/jpeg";
+    const contentType = (r.headers.get("content-type") || "image/jpeg")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (!SATORI_IMAGE_TYPES.has(contentType)) {
+      const { default: sharp } = await import("sharp");
+      const jpeg = await sharp(Buffer.from(buf), {
+        limitInputPixels: MAX_CONVERT_PIXELS,
+      })
+        .rotate()
+        .resize(CARD_IMAGE_BOX.width, CARD_IMAGE_BOX.height, {
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .flatten({ background: "#ffffff" })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+    }
     return `data:${contentType};base64,${Buffer.from(buf).toString("base64")}`;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+// Prefers our own stored copy of the display tier: it is already ours to
+// serve, and institutions can bot-challenge a server-side fetch of the origin.
+async function cardImageDataUri(
+  client: ReturnType<typeof getSql>,
+  row: ItemRow,
+): Promise<string | null> {
+  if (!row.img) return null;
+  const cdnBaseUrl = configFromEnv().cdnBaseUrl;
+  if (client && cdnBaseUrl && row.native_id) {
+    try {
+      const entries = (await client.query(
+        "SELECT object_key FROM img_cache_entries WHERE cache_key = $1 AND object_key IS NOT NULL",
+        [`${row.source}:${row.native_id}:display`],
+      )) as { object_key: string }[];
+      const hit = resolveHit(entries[0], { cdnBaseUrl });
+      if (hit.from === "cdn") return await fetchImageDataUri(hit.url, "cdn");
+    } catch (_e) {
+      // fall through to the origin
+    }
+  }
+  try {
+    return await fetchImageDataUri(row.img, row.source);
+  } catch (_e) {
+    return null;
   }
 }
 
@@ -401,6 +464,21 @@ function buildShelfCard(
   });
 }
 
+function buildCategoryCard(
+  name: string,
+  imageDataUri: string | null,
+  accentColor: string | null | undefined,
+): CardNode {
+  return buildShareCard({
+    eyebrow: "Tranquilo",
+    title: name,
+    caption: "A calm scroll of public-domain art",
+    captionStyle: { fontWeight: 300, fontSize: 25 },
+    imageDataUri: imageDataUri,
+    accentColor: accentColor,
+  });
+}
+
 function buildDiscoverCard(
   imageDataUri: string | null,
   accentColor: string | null | undefined,
@@ -423,11 +501,7 @@ async function coverDataUriFor(
   if (!cover?.img) return null;
   const held = await sourceHealth.heldSourceSet(client, [cover.source]);
   if (held[cover.source]) return null;
-  try {
-    return await fetchImageDataUri(cover.img, cover.source);
-  } catch (_e) {
-    return null;
-  }
+  return cardImageDataUri(client, cover);
 }
 
 function buildFallbackCard(message: string) {
@@ -464,7 +538,7 @@ function buildFallbackCard(message: string) {
   );
 }
 
-export { fetchImageDataUri };
+export { cardImageDataUri, fetchImageDataUri };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -519,11 +593,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           // than being fetched from our servers on every unfurl.
           const held = await sourceHealth.heldSourceSet(client, [cover.source]);
           if (!held[cover.source]) {
-            try {
-              coverDataUri = await fetchImageDataUri(cover.img, cover.source);
-            } catch (_e) {
-              coverDataUri = null;
-            }
+            coverDataUri = await cardImageDataUri(client, cover);
           }
         }
         tree0 = buildStorylineCard(
@@ -572,6 +642,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400");
       res.end(Buffer.from(await discoverImage.arrayBuffer()));
+      return;
+    }
+
+    if (slug.startsWith("category-")) {
+      const name = categoryFromPageSlug(slug.slice("category-".length));
+      let categoryTree = buildFallbackCard("Tranquilo");
+      if (name) {
+        categoryTree = buildCategoryCard(name, null, null);
+        const coverRef = CATEGORY_COVERS[name];
+        if (client && coverRef) {
+          try {
+            const rows = (await client.query(
+              `SELECT * FROM items WHERE source = $1 AND native_id = $2 ${LIVE_ITEMS_AND} LIMIT 1`,
+              [coverRef.source, coverRef.nativeId],
+            )) as ItemRow[];
+            const cover = rows[0] || null;
+            categoryTree = buildCategoryCard(
+              name,
+              await coverDataUriFor(client, cover),
+              cover?.accent_color,
+            );
+          } catch (err) {
+            console.error("og/[slug]: category cover failed", err);
+            await reportError(err);
+          }
+        }
+      }
+      const categoryImage = new ImageResponse(categoryTree, {
+        width: 1200,
+        height: 630,
+        fonts: await loadFonts(),
+      });
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400");
+      res.end(Buffer.from(await categoryImage.arrayBuffer()));
       return;
     }
 
@@ -629,18 +735,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       tree = buildFallbackCard("Tranquilo");
     } else {
       let imageDataUri: string | null = null;
-      // item.img is the raw origin URL, not the /img proxy URL --
-      // fetched directly from the source institution on every unfurl,
-      // so a held source is skipped for a text-only card instead.
+      // A held source is skipped for a text-only card instead.
       const heldSources = await sourceHealth.heldSourceSet(client, [
         item.source,
       ]);
       if (item.img && !heldSources[item.source]) {
-        try {
-          imageDataUri = await fetchImageDataUri(item.img, item.source);
-        } catch (_e) {
-          imageDataUri = null; // fall back to the text-only layout below
-        }
+        imageDataUri = await cardImageDataUri(client, item);
       }
       tree = buildCard(item, imageDataUri);
     }

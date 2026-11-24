@@ -9,8 +9,7 @@
 // Safe against live traffic via content-addressing: the re-encoded bytes
 // hash differently, landing on a new key while the old one stays in place,
 // so every immutable browser-cached response keeps resolving. Reads only
-// from our own S3 bucket, never Commons, so the Wikimedia rate-limit hold
-// stays untouched.
+// from our own S3 bucket, never Commons.
 //
 //   node scripts/reencode_oversized_images.mts                  # dry run
 //   node scripts/reencode_oversized_images.mts --commit
@@ -27,24 +26,32 @@ export const DEFAULT_MIN_BYTES = 1024 * 1024; // 1 MB
 // object, a row update and an orphaned predecessor.
 export const MIN_SAVING_FRACTION = 0.1;
 
-export function isCandidate(entry: any, minBytes: any) {
-  if (!entry?.bytes) return false;
+// Postgres returns BIGINT columns as strings, hence `number | string`.
+interface CacheEntry {
+  bytes: number | string | null;
+  object_key?: string | null;
+}
+
+interface ReencodeResult {
+  before: number;
+  after: number;
+}
+
+export function isCandidate(entry: CacheEntry, minBytes: number) {
+  if (!entry.bytes) return false;
   if ("object_key" in entry && !entry.object_key) return false;
   return Number(entry.bytes) > minBytes;
 }
 
-export function shouldReplace(beforeBytes: any, afterBytes: any) {
+export function shouldReplace(beforeBytes: number, afterBytes: number) {
   if (!afterBytes || afterBytes >= beforeBytes) return false;
   return (beforeBytes - afterBytes) / beforeBytes >= MIN_SAVING_FRACTION;
 }
 
-export function summarise(results: any) {
+export function summarise(results: ReencodeResult[]) {
   const objects = results.length;
-  const savedBytes = results.reduce(
-    (a: any, r: any) => a + (r.before - r.after),
-    0,
-  );
-  const before = results.reduce((a: any, r: any) => a + r.before, 0);
+  const savedBytes = results.reduce((a, r) => a + (r.before - r.after), 0);
+  const before = results.reduce((a, r) => a + r.before, 0);
   return {
     objects,
     savedBytes,
@@ -52,7 +59,12 @@ export function summarise(results: any) {
   };
 }
 
-export function keyFor(source: any, nativeId: any, tier: any, hash: any) {
+export function keyFor(
+  source: string,
+  nativeId: string | number,
+  tier: string,
+  hash: string | null | undefined,
+) {
   return objectKey.objectKeyFor(source, nativeId, tier, hash);
 }
 
@@ -82,7 +94,7 @@ async function runCli() {
   const s3 = await import(pathToFileURL(path.join(ROOT, "lib/img-s3.ts")).href);
 
   const args = process.argv.slice(2);
-  const optOf = (n: any, d: any) => {
+  const optOf = (n: string, d: number) => {
     const i = args.indexOf(`--${n}`);
     return i === -1 ? d : args[i + 1];
   };
@@ -92,7 +104,7 @@ async function runCli() {
 
   const sql = neon(process.env.DATABASE_URL!);
   const cfg = store.configFromEnv();
-  const kb = (n: any) => `${(n / 1024).toFixed(0)} kB`;
+  const kb = (n: number) => `${(n / 1024).toFixed(0)} kB`;
 
   async function main() {
     // Config is checked in the COMMIT path only -- a dry run is a database
@@ -141,7 +153,7 @@ async function runCli() {
       );
     }
 
-    const results = [];
+    const results: ReencodeResult[] = [];
     let skipped = 0,
       failed = 0;
 
@@ -200,7 +212,7 @@ async function runCli() {
       } catch (err) {
         failed++;
         console.log(
-          `  ERR   ${r.cache_key} -- ${String(((err as any) && (err as any).message) || err)}`,
+          `  ERR   ${r.cache_key} -- ${String(err instanceof Error ? err.message : err)}`,
         );
       }
     }
@@ -217,8 +229,8 @@ async function runCli() {
     );
   }
 
-  await main().catch((e: any) => {
-    console.error("FATAL", e?.message || e);
+  await main().catch((e: unknown) => {
+    console.error("FATAL", e instanceof Error ? e.message : e);
     process.exit(1);
   });
 }

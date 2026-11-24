@@ -3,8 +3,8 @@ import { staticPageAlternates, TRANSLATED_PAGES } from "../src/i18n/pages.ts";
 
 type TranslatedPages = Readonly<Record<string, readonly string[]>>;
 
-function escapeXml(value: string): string {
-  return value
+export function escapeXml(value: string): string {
+  return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -18,7 +18,7 @@ export function renderStaticPageHreflangLinks(
   locales: readonly LocaleInfo[] = LOCALES,
   translatedPages: TranslatedPages = TRANSLATED_PAGES,
 ): string {
-  const file = pagePath.slice("/pages/".length);
+  const file = pagePath.split("/").at(-1) ?? pagePath;
   return staticPageAlternates(file, locales, translatedPages)
     .map(
       ({ hreflang, path }) =>

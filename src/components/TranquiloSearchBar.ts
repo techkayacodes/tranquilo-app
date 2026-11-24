@@ -4,9 +4,18 @@
 // Different integration shape from TranquiloTopbar/TranquiloMusicToggle,
 // deliberately: those hand app.js decisions through a host-object
 // property. This element instead dispatches CustomEvents (search-submit,
-// search-close-request) so any component could listen without this
-// element changing. State flows the other way as plain method calls
-// (open(), close(), setResultsLine()).
+// search-close-request, storyline-filter-toggle) so any component could
+// listen without this element changing. State flows the other way as
+// plain method calls (open(), close(), setResultsLine()).
+//
+// The "Has storyline" toggle moved here from a topbar chip
+// (still called `.storyline-filter-toggle` in CSS/markup for the shorter
+// name) because the chips row and the filter banner are alternatives,
+// never both visible at once -- the chip disappeared, with no way to
+// toggle it, the moment any search or concept was active, which is
+// exactly the combination ("storyline items matching X") it exists for.
+// Living in the panel instead means it's reachable regardless of what
+// else is active.
 //
 // app.js still decides what a submitted/cleared query means for the feed
 // and still owns the overlay-stack/feed-scroll-compensation machinery
@@ -21,6 +30,7 @@
 // creates inside the results line and wires up itself.
 
 import { type FacetField, facetLabel, t } from "../i18n/index";
+import type { InstitutionOption } from "../logic/institutions";
 import {
   findDidYouMean,
   isNamedMaker,
@@ -51,6 +61,7 @@ export interface SearchFacets {
   era?: FacetEntry[];
   type?: FacetEntry[];
   color?: FacetEntry[];
+  palette_bucket?: FacetEntry[];
 }
 
 interface SearchSuggestion {
@@ -71,6 +82,15 @@ const searchBarMarkup = () => `
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
   </button>
   <button id="searchClose" type="button" aria-label="${escapeHtml(t("search.close"))}">&times;</button>
+</div>
+<div class="search-filter-row">
+  <select id="searchSourceSelect" class="search-source-select" aria-label="${escapeHtml(t("search.sourceLabel"))}" hidden>
+    <option value="">${escapeHtml(t("search.allSources"))}</option>
+  </select>
+  <label class="storyline-filter-toggle" id="storylineFilterToggle">
+    <input type="checkbox" id="storylineFilterCheckbox">
+    <span>Has storyline</span>
+  </label>
 </div>
 <div class="search-results-line" id="searchResultsLine" aria-live="polite"></div>
 <div class="search-suggestions" id="searchSuggestions"></div>
@@ -113,6 +133,9 @@ export class TranquiloSearchBar extends HTMLElement {
   private inputEl!: HTMLInputElement;
   private resultsLineEl!: HTMLElement;
   private suggestionsEl!: HTMLElement;
+  private submitBtnEl!: HTMLButtonElement;
+  private storylineCheckboxEl!: HTMLInputElement;
+  private sourceSelectEl!: HTMLSelectElement;
 
   private history: string[] = [];
   private highlightIndex = -1;
@@ -140,7 +163,33 @@ export class TranquiloSearchBar extends HTMLElement {
     this.resultsLineEl = this.requireEl<HTMLElement>("#searchResultsLine");
     this.suggestionsEl = this.requireEl<HTMLElement>("#searchSuggestions");
     const submitBtn = this.requireEl<HTMLButtonElement>("#searchSubmit");
+    this.submitBtnEl = submitBtn;
     const closeBtn = this.requireEl<HTMLButtonElement>("#searchClose");
+    this.storylineCheckboxEl = this.requireEl<HTMLInputElement>(
+      "#storylineFilterCheckbox",
+    );
+    this.sourceSelectEl = this.requireEl<HTMLSelectElement>(
+      "#searchSourceSelect",
+    );
+    on(this.sourceSelectEl, "change", () => {
+      this.dispatchEvent(
+        new CustomEvent("source-change", {
+          detail: {
+            source: this.sourceSelectEl.value || null,
+            query: this.inputEl.value,
+          },
+          bubbles: true,
+        }),
+      );
+    });
+    on(this.storylineCheckboxEl, "change", () => {
+      this.dispatchEvent(
+        new CustomEvent("storyline-filter-toggle", {
+          detail: { on: this.storylineCheckboxEl.checked },
+          bubbles: true,
+        }),
+      );
+    });
 
     this.history = this.loadHistory();
 
@@ -207,6 +256,47 @@ export class TranquiloSearchBar extends HTMLElement {
 
   setResultsLine(html: string): void {
     this.resultsLineEl.innerHTML = html;
+  }
+
+  // Real "processing" feedback for the round trip run() makes (count,
+  // then possibly a spelling-correction or concept-probe lookup) --
+  // without this the submit button just sat there through the whole gap,
+  // reading as a hang rather than work in progress. Disabling too, so a
+  // second Enter/click mid-flight can't fire a second overlapping run().
+  setLoading(loading: boolean): void {
+    this.submitBtnEl.classList.toggle("loading", loading);
+    this.submitBtnEl.disabled = loading;
+  }
+
+  // Kept in sync by app.js's renderChips() on every filter change, not
+  // just on open() -- the checkbox has to reflect reality even when
+  // something else (clearing the whole filter banner, say) turned the
+  // storyline filter off while the panel was closed.
+  setStorylineActive(active: boolean): void {
+    this.storylineCheckboxEl.checked = active;
+  }
+
+  // Called once by app.js after its startup facets fetch. With no
+  // institutions to offer, the dropdown stays hidden.
+  setSourceOptions(options: readonly InstitutionOption[]): void {
+    this.sourceSelectEl
+      .querySelectorAll("option:not([value=''])")
+      .forEach((el) => {
+        el.remove();
+      });
+    options.forEach(({ value, label }) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      this.sourceSelectEl.appendChild(option);
+    });
+    this.sourceSelectEl.hidden = options.length === 0;
+  }
+
+  // Kept in sync by app.js's renderChips(), like setStorylineActive().
+  setSourceActive(source: string | null): void {
+    this.sourceSelectEl.value = source ?? "";
+    this.sourceSelectEl.classList.toggle("active", source !== null);
   }
 
   // Called by app.js's runSearch() at the top of every submit, before it

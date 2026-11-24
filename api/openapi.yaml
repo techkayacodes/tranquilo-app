@@ -4,15 +4,35 @@ info:
   description: >-
     AWS lambdas backing tranquilo.art. Every function under
     api/ is documented here (public routes and internal AWS lambda cron
-    endpoints alike) — see CONVENTIONS.md for why these stay one file per
+    endpoints alike) -- see CONVENTIONS.md for why these stay one file per
     route rather than a framework, and README.md's "API" section for the
-    prose version of most of what's below. Not machine-verified against the
-    handlers (no contract-testing setup exists yet) — kept in sync by hand
-    as routes change; treat a mismatch as this file being stale, not the
-    handler.
+    prose version of most of what's below. Kept in sync by hand as routes
+    change; treat a mismatch as this file being stale, not the handler. The
+    locale and translation contract (`x-supported-locales`,
+    `x-translatable-fields`, `Translated`) is checked against the code by
+    tests/openapi-locale-contract.test.ts.
+
+
+    **Versioning and deprecation.** `info.version` follows semantic
+    versioning, and the `/v1/` routes are the stable contract for keyed
+    integrators. Within a major version the API MAY add endpoints, optional
+    parameters, response fields, enum values, locales and translatable
+    fields, so clients MUST ignore fields they do not recognise. Removing or
+    renaming a documented field, parameter, shape or route, changing a
+    field's type or meaning, or making an optional parameter required is a
+    breaking change and MUST ship as a new major version (`/v2/`). Fixing
+    behaviour that contradicts this document is not a breaking change.
+
+
+    A feature slated for removal is deprecated first. From the day it is
+    announced, its responses SHOULD carry a `Deprecation` header and, once a
+    removal date is set, a `Sunset` header with that date. The notice period
+    between announcement and removal MUST be at least 90 days. The previous
+    major version MUST keep working for at least 90 days after its successor
+    is released. Each deprecation and removal is recorded in CHANGELOG.md.
   version: "1.0.0"
   license:
-    name: UNLICENSED
+    name: Private. Terms are provided with API access.
 servers:
   - url: https://tranquilo.art
     description: Production
@@ -62,10 +82,16 @@ paths:
             parameter; see `VocabularyLabels`. `detail` returns one item's
             curated text (caption, grounding sources, cast, plot twist) and
             requires `key`; see `ItemDetail`. It has a per-visitor request
-            budget of its own, apart from the page budget.
+            budget of its own, apart from the page budget. `print_quote`
+            returns the price and approximate delivery of one print for an
+            artwork shipped to a country, as `{ available, total, item,
+            delivery, currency, minDays, maxDays, madeIn }`, or
+            `{ available: false }` where it cannot be delivered. It requires
+            `key`, `product` and `country`, has a per-visitor request budget
+            of its own, and is never cached at the edge.
           schema:
             type: string
-            enum: [manifest, facets, suggest, correction, count, storylines, storyline, shelves, music, heroes, print_region, vocabulary, detail]
+            enum: [manifest, facets, suggest, correction, count, storylines, storyline, shelves, music, heroes, print_region, print_quote, vocabulary, detail]
         - name: keys
           in: query
           description: >-
@@ -96,8 +122,19 @@ paths:
         - name: key
           in: query
           description: >-
-            Required with `shape=detail` -- one `source:native_id`, split on
-            the first colon.
+            Required with `shape=detail` and `shape=print_quote` -- one
+            `source:native_id`, split on the first colon.
+          schema: { type: string }
+        - name: product
+          in: query
+          description: Required with `shape=print_quote`.
+          schema:
+            type: string
+            enum: [mini_print, poster, framed, tote, mug]
+        - name: country
+          in: query
+          description: >-
+            Required with `shape=print_quote` -- a two-letter country code.
           schema: { type: string }
         - name: id
           in: query
@@ -272,6 +309,26 @@ paths:
         correction, count, detail), answered under a per-key quota instead of
         the per-visitor budget. Full item rows carry an extra `keyed` object.
         Responses are never cached (`Cache-Control: private, no-store`).
+
+        `shape=listing` is the one shape that exists only here, for partner
+        and internal keys (a community key gets a 403). It returns one light
+        row per live item, `{key, updated_at}`, ordered by `updated_at` then
+        `key`, at most 100 per page; follow `next_cursor` until it is null.
+        Each `key` is the `source:native_id` form `?keys=` accepts, so a page
+        is exactly one full-row lookup. Quota is charged by page size.
+
+        To follow changes, pass `updated_since` (an ISO 8601 time with a
+        zone). The listing then also reports items that left the catalogue as
+        `{key, updated_at, removed: true}`, with no reason given. A client
+        that finishes a listing or a change feed SHOULD keep the last
+        `updated_at` it saw, and start the next change feed a few minutes
+        before it, applying rows idempotently by `key`: a write that is still
+        committing can carry a slightly earlier time than one already served.
+
+        `updated_at` moves when an item's content changes. It does not move
+        for pipeline bookkeeping: a feed reshuffle (`shuffle_key`), a rules
+        re-run (`rules_version`) or a source recheck (`source_verified_at`).
+
         Shapes that are not catalogue queries (`storylines`, `storyline`,
         `set_of_works`, `set_of_work`, `shelves`, `music`, `heroes`,
         `vocabulary`, `print_region`) are a 400; use `/api/items` for those.
@@ -290,6 +347,7 @@ paths:
                   - $ref: "#/components/schemas/CorrectionResult"
                   - $ref: "#/components/schemas/CountResult"
                   - $ref: "#/components/schemas/ItemDetailResult"
+                  - $ref: "#/components/schemas/ListingPage"
         "400":
           description: Caller error, as for `/api/items`, or a shape with no keyed form.
           content:
@@ -298,6 +356,10 @@ paths:
           description: Missing, unknown or revoked key.
           headers:
             WWW-Authenticate: { schema: { type: string } }
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "403":
+          description: '`shape=listing` with a community key.'
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
         "404":
@@ -642,12 +704,14 @@ paths:
   /sitemap.xml:
     get:
       tags: [sharing]
-      summary: Sitemap of every live artwork and static page
+      summary: Sitemap of site pages, categories, shelves and storylines
       operationId: getSitemap
       description: >-
         Generated per-request (rewritten from `/sitemap.xml` to
-        `/api/sitemap`) rather than checked in, since the catalogue changes
-        without a deploy. Quarantined/rejected items are never listed.
+        `/api/sitemap`) rather than checked in, since shelves and storylines
+        change without a deploy. Lists the home page, static pages,
+        `/discover`, category landing pages, shelves and storylines.
+        Individual artworks are not listed.
       responses:
         "200":
           description: Sitemap XML.
@@ -937,9 +1001,9 @@ components:
     ItemDetail:
       type: object
       description: >-
-        The curated text of an item, served one item at a time and only by
-        `?shape=detail` -- item rows carry none of it, only `cast_tier`,
-        `twist_category` and `twist_hook`. `caption_tea` is translated under
+        The curated text and palette buckets of an item, served one item at a
+        time and only by `?shape=detail` -- item rows carry none of it, only
+        `cast_tier`, `twist_category` and `twist_hook`. `caption_tea` is translated under
         `locale` like any item row.
       properties:
         caption_tea: { type: string, nullable: true }
@@ -965,6 +1029,10 @@ components:
         cast_context: {}
         twist_story: { type: string, nullable: true }
         twist_source_url: { type: string, nullable: true }
+        palette_buckets:
+          type: array
+          description: The palette buckets the work was classified into, served only here and never on item rows.
+          items: { type: string }
     ManifestItem:
       type: object
       description: The lightweight order-manifest shape (`?shape=manifest`) -- identity and facets only, no heavy text/image fields.
@@ -1004,6 +1072,30 @@ components:
           type: string
           nullable: true
           description: Null once the session has seen the whole live catalogue exactly once.
+    ListingPage:
+      type: object
+      description: '`/v1/items?shape=listing` -- a page of items by change time, partner and internal keys only.'
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [key, updated_at]
+            properties:
+              key: { type: string, description: 'source:native_id, as `?keys=` takes it.' }
+              updated_at:
+                type: string
+                format: date-time
+                description: UTC, always six fractional digits.
+              removed:
+                type: boolean
+                enum: [true]
+                description: Present only with `updated_since`, for an item that is no longer in the catalogue.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Null on the last page.
     FacetsResult:
       type: object
       description: >-

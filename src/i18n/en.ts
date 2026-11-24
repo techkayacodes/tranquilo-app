@@ -23,12 +23,12 @@ export const en = {
   "feed.scrollHint": "scroll to explore",
 
   // Intro slide (src/feed/introSlides.ts). {works} is a rounded count like
-  // "10k+"; {count} is the number of sources.
+  // "10k+"; {count} is the number of museums.
   "intro.heading": "A calmer way to scroll.",
   "intro.tagline.one":
-    "Enjoy calm scrolling with {works} public-domain works across {count} source.",
+    "Enjoy calm scrolling with {works} public-domain works across {count} museum and more.",
   "intro.tagline.other":
-    "Enjoy calm scrolling with {works} public-domain works across {count} sources.",
+    "Enjoy calm scrolling with {works} public-domain works across {count} museums and more.",
   "intro.mission.title": "Mission",
   "intro.mission.body": "Open source & ad‑free.",
   "intro.mission.cta": "Get involved",
@@ -89,6 +89,9 @@ export const en = {
   "detail.cast.noDetail": "No verified detail available yet.",
   "detail.fact.didYouKnow": "Did you know?",
   "detail.fact.basic": "Basic Information",
+  "detail.palette.find": "Find more art in {bucket}",
+  "detail.palette.tooltip":
+    "{bucket}: click to see all works with a {bucketLower} palette",
   "detail.meta.artist": "Artist",
   "detail.meta.created": "Created",
   "detail.meta.material": "Material",
@@ -112,10 +115,13 @@ export const en = {
   "detail.cite.failed": "Couldn't copy",
   "detail.print.button": "Get a print",
   "detail.print.soon": "Checkout is opening soon.",
-  "detail.print.price": "about {price}",
-  "detail.print.priceFrom": "{price} +",
-  "detail.print.estimate": "Estimated prices, delivery included.",
-  "detail.print.startingPrice": "Starting prices, delivery not included.",
+  "detail.print.shipTo": "Ship to",
+  "detail.print.priceLoading": "Getting price…",
+  "detail.print.priceUnavailable": "Price unavailable",
+  "detail.print.notAvailable": "Not available in {country}",
+  "detail.print.deliveryIncluded": "includes about {price} delivery",
+  "detail.print.deliveryDays": "{min}–{max} days",
+  "detail.print.approximate": "Delivery prices are approximate.",
   "detail.print.importTax":
     "The buyer is responsible for import taxes in Brazil.",
   "detail.print.showMockup": "Show the {product} mock-up",
@@ -151,11 +157,15 @@ export const en = {
   "search.related": "Showing pieces related to “{concept}”",
   "search.results.one": "{count} result for “{query}”",
   "search.results.other": "{count} results for “{query}”",
+  "search.sourceLabel": "Source",
+  "search.allSources": "All sources",
+  "search.inSource": "in {source}",
   "search.noResults": "No results for “{query}.”",
   "search.didYouMean": "No results for “{query}.” Did you mean {suggestion}?",
 
   // Filter banner under the top bar.
   "filter.moreBy": "More by {artist}",
+  "filter.fromSource": "Works from {source}",
   "filter.collection": "{title} ({count})",
   "collection.toast.empty": "Nothing collected yet",
 
@@ -164,6 +174,12 @@ export const en = {
 
   // Shown when the catalogue fails to load (src/errorState.ts).
   "error.heading": "We’re having a problem right now, but we’ll be back soon.",
+  "error.rateLimited":
+    "We’re getting a lot of requests right now! Please wait a minute or two, then refresh to try again.",
+  "error.rateLimitedWait.one":
+    "We’re getting a lot of requests right now! Please wait about {count} minute, then refresh to try again.",
+  "error.rateLimitedWait.other":
+    "We’re getting a lot of requests right now! Please wait about {count} minutes, then refresh to try again.",
   "error.retry": "Try again",
   "error.home": "Back to Tranquilo",
 
@@ -294,11 +310,11 @@ export const en = {
   "artistCard.wikipedia": "Read more on Wikipedia",
   "artistCard.wikidata": "View on Wikidata",
 
-  // Category chip row: the reset chip (its filter value stays "All"), the
-  // Storyline toggle, and the overflow menu button.
   "chips.all": "All",
-  "chips.storyline": "Storyline",
   "chips.more": "More",
+
+  "filters.palette": "Palette",
+  "filters.allPalettes": "All palettes",
 
   // Display labels for controlled-vocabulary values, keyed by facetKey()
   // (src/i18n/facets.ts) and rendered with facetLabel(). Every term in

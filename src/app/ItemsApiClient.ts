@@ -4,9 +4,11 @@ import type { FeedPageResponse } from "../feed/recycleWindow";
 import type { HeroPoolEntry } from "../types/HeroPoolEntry";
 import type { Item, ItemDetail } from "../types/Item";
 import type { MusicBucket } from "../types/MusicBucket";
+import type { PrintQuoteResult } from "../types/PrintQuote";
 import type { SetOfWork, SetOfWorkIndexEntry } from "../types/SetOfWork";
 import type { Shelf } from "../types/Shelf";
 import type { Storyline, StorylineIndexEntry } from "../types/Storyline";
+import { assertOk } from "./RateLimitedError";
 
 // All fetches against api/items -- the catalogue is server-paged and
 // server-aggregated now, not a single manifest read once at startup.
@@ -19,7 +21,7 @@ const MAX_IDS_PER_LOOKUP = TRANQUILO_CONFIG.feed.max_ids_per_lookup;
 type IdsLookup = { items?: Item[]; missing?: string[] };
 
 export type FacetsResponse = SearchFacets & {
-  sources?: unknown[];
+  sources?: { value: string; count: number }[];
   total?: number;
 };
 
@@ -55,9 +57,7 @@ export class ItemsApiClient {
 
   fetchJson<T = unknown>(url: string, what: string): Promise<T> {
     return fetch(url).then((res) => {
-      if (!res.ok) {
-        throw new Error(`api/items ${what} responded with ${res.status}`);
-      }
+      assertOk(res, what);
       return res.json();
     });
   }
@@ -93,6 +93,17 @@ export class ItemsApiClient {
     return this.fetchJson(
       this.apiUrl({ shape: "print_region" }),
       "print region",
+    );
+  }
+
+  fetchPrintQuote(
+    key: string,
+    product: string,
+    country: string,
+  ): Promise<PrintQuoteResult> {
+    return this.fetchJson<PrintQuoteResult>(
+      this.apiUrl({ shape: "print_quote", key, product, country }),
+      "print quote",
     );
   }
 
@@ -229,9 +240,7 @@ export class ItemsApiClient {
       .map((value) => `${param}=${encodeURIComponent(value)}`)
       .join("&");
     return fetch(`/api/items?${query}${this.suffix()}`).then((res) => {
-      if (!res.ok) {
-        throw new Error(`api/items lookup responded with ${res.status}`);
-      }
+      assertOk(res, "lookup");
       return res.json() as Promise<IdsLookup>;
     });
   }

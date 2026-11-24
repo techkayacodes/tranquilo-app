@@ -27,6 +27,7 @@ import {
 import { TRANQUILO_CONFIG } from "../lib/config.generated.ts";
 import { signCursor, verifyCursor } from "../lib/cursor-signature.ts";
 import { getSql } from "../lib/db.ts";
+import { quotePrint } from "../lib/gelato-quote.ts";
 import { getHeroPool } from "../lib/hero-items.ts";
 import { FACETS, facetClauses } from "../lib/item-facets.ts";
 import {
@@ -36,7 +37,9 @@ import {
 } from "../lib/items-rate-limit.ts";
 import { LIVE_ITEMS_PREDICATE } from "../lib/items-sql.ts";
 import { getMusicBuckets } from "../lib/music.ts";
+import { handlePrintQuote } from "../lib/print-quote-api.ts";
 import { printRegionFromHeaders } from "../lib/print-region.ts";
+import { MAX_QUERY_CHARS } from "../lib/query-limits.ts";
 import { safeHttpUrl } from "../lib/safe-url.ts";
 import { reportError } from "../lib/sentry.ts";
 import { getSetOfWork, getSetOfWorksIndex } from "../lib/setOfWorks.ts";
@@ -59,6 +62,10 @@ type QueryParams = Record<string, string | string[] | undefined>;
 // Only ?ids= and ?keys= may repeat; any other repeated param takes its first value.
 function scalar(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function queryText(params: QueryParams): string {
+  return (scalar(params.q) ?? "").trim().slice(0, MAX_QUERY_CHARS);
 }
 
 interface ItemRow {
@@ -94,6 +101,8 @@ interface BuiltQuery {
   counting?: true;
   lookup?: true;
   detail?: true;
+  listing?: true;
+  includeRemoved?: boolean;
   requestedIds?: string[];
   byKey?: true;
   limit?: number;
@@ -276,6 +285,7 @@ function serializeCuratedText(row: ItemRow) {
     cast_context: parseJsonbField(row.cast_context),
     twist_story: row.twist_story,
     twist_source_url: safeHttpUrl(row.twist_source_url),
+    palette_buckets: row.palette_buckets ?? [],
   };
 }
 
@@ -287,6 +297,10 @@ function serializeKeyedExtras(row: ItemRow) {
     rules_version: row.rules_version,
   };
 }
+
+// Shared-cache policy for boot data and feed pages.
+const EDGE_LONG_CACHE =
+  "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
 
 // Shapes that are not catalogue queries have no keyed form; they stay on the
 // public path.
@@ -309,6 +323,7 @@ function authorizationHeader(req: VercelRequest): string | undefined {
 
 function keyedShapeName(query: BuiltQuery): string {
   if (query.detail) return "detail";
+  if (query.listing) return "listing";
   if (query.manifest) return "manifest";
   if (query.facets) return "facets";
   if (query.suggest) return "suggest";
@@ -449,6 +464,98 @@ function parseStart(value: string | undefined): number {
 }
 
 // ---------------------------------------------------------------------------
+// The keyed listing (?shape=listing): every item as a key plus the time it
+// last changed, ordered by (updated_at, id). The same order serves a full
+// enumeration and "what changed since". Only partner and internal keys.
+// ---------------------------------------------------------------------------
+
+// Fixed width, so clients never meet two formats and a cursor round-trips
+// the exact microsecond.
+const LISTING_TIME_FORMAT = `YYYY-MM-DD"T"HH24:MI:SS.US"Z"`;
+const LISTING_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const SINCE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
+const LISTING_EPOCH = "1970-01-01T00:00:00.000000Z";
+
+interface ListingRow {
+  key: string;
+  updated_at: string;
+  removed: boolean;
+}
+
+function encodeListingCursor(
+  updatedAt: string,
+  key: string,
+  includeRemoved: boolean,
+): string {
+  const payload = Buffer.from(
+    [updatedAt, key, includeRemoved ? "1" : "0"].join("\u0000"),
+    "utf8",
+  ).toString("base64url");
+  return signCursor(payload, process.env.ITEMS_CURSOR_SECRET);
+}
+
+function decodeListingCursor(cursor: string) {
+  const bad = Object.assign(new Error("malformed cursor"), { status: 400 });
+  const payload = verifyCursor(String(cursor), process.env.ITEMS_CURSOR_SECRET);
+  if (payload === null) throw bad;
+  const parts = Buffer.from(payload, "base64url")
+    .toString("utf8")
+    .split("\u0000");
+  if (parts.length !== 3 || !LISTING_TIME.test(parts[0]) || !parts[1]) {
+    throw bad;
+  }
+  if (parts[2] !== "0" && parts[2] !== "1") throw bad;
+  return {
+    updatedAt: parts[0],
+    key: parts[1],
+    includeRemoved: parts[2] === "1",
+  };
+}
+
+function listingQuery(params: QueryParams): BuiltQuery {
+  const limit = Math.min(
+    Math.max(parseInt(scalar(params.limit) ?? "", 10) || MAX_IDS, 1),
+    MAX_IDS,
+  );
+  const cursor = scalar(params.cursor);
+  const since = scalar(params.updated_since);
+
+  let after = LISTING_EPOCH;
+  let afterKey = "";
+  let includeRemoved = false;
+  if (cursor) {
+    const c = decodeListingCursor(cursor);
+    after = c.updatedAt;
+    afterKey = c.key;
+    includeRemoved = c.includeRemoved;
+  } else if (since) {
+    if (!SINCE_TIME.test(since) || Number.isNaN(Date.parse(since))) {
+      throw Object.assign(
+        new Error("updated_since must be an ISO 8601 time with a zone"),
+        { status: 400 },
+      );
+    }
+    after = since;
+    includeRemoved = true;
+  }
+
+  const where = [`(updated_at, id) > ($1::timestamptz, $2)`];
+  if (!includeRemoved) where.push(LIVE_ITEMS_PREDICATE);
+  // items.updated_at, qualified: bare, ORDER BY sorts the output alias, not the index.
+  return {
+    text:
+      `SELECT id AS key, to_char(updated_at AT TIME ZONE 'UTC', '${LISTING_TIME_FORMAT}') AS updated_at,` +
+      ` COALESCE(NOT (${LIVE_ITEMS_PREDICATE}), true) AS removed` +
+      ` FROM items WHERE ${where.join(" AND ")} ORDER BY items.updated_at ASC, items.id ASC LIMIT $3`,
+    params: [after, afterKey, limit],
+    listing: true,
+    includeRemoved,
+    limit,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate shapes -- answer questions about the catalogue without
 // shipping it. Safe to return whole because they're bounded by the
 // number of DISTINCT VALUES, not by item count.
@@ -510,7 +617,7 @@ const SUGGEST_LIMIT = 8;
 const SUGGEST_MIN_CHARS = 2;
 
 function suggestQuery(params: QueryParams): BuiltQuery {
-  const q = (scalar(params.q) ?? "").trim();
+  const q = queryText(params);
   if (q.length < SUGGEST_MIN_CHARS) {
     return { suggest: true, empty: true, text: null, params: [] };
   }
@@ -559,7 +666,7 @@ function vocabLocale(params: QueryParams): string | null {
 // (fuzzystrmatch's levenshtein() isn't installed on this database);
 // the client still scores candidates with its own findDidYouMean().
 function correctionQuery(params: QueryParams): BuiltQuery {
-  const q = (scalar(params.q) || "").trim();
+  const q = queryText(params);
   const locale = vocabLocale(params);
   const words = locale
     ? "(SELECT word FROM items_vocab_words" +
@@ -659,6 +766,7 @@ function buildQuery(params: QueryParams): BuiltQuery {
   if (shape === "vibe_search") return vibeSearchQuery(params);
 
   if (shape === "detail") return detailQuery(params);
+  if (shape === "listing") return listingQuery(params);
 
   const where = [LIVE_ITEMS_PREDICATE];
   const values: unknown[] = [];
@@ -742,7 +850,7 @@ function buildQuery(params: QueryParams): BuiltQuery {
   // lowercased substring test across search_text, OR'd with the
   // century rule from matchesTimeframe(). Checked live by
   // scripts/verify_feed_fixtures.mts.
-  const q = (scalar(params.q) || "").trim();
+  const q = queryText(params);
   if (q) {
     const needle = `immutable_unaccent(lower(${bind(q)}))`;
     const locale = parseLocaleParam(params.locale);
@@ -895,6 +1003,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
+  if (req.query?.shape === "print_quote") {
+    const apiKey = process.env.GELATO_KEY;
+    await handlePrintQuote(req, res, {
+      sql: getSql(),
+      apiKey,
+      quote: (args) => quotePrint({ ...args, apiKey: apiKey ?? "" }),
+    });
+    return;
+  }
+
   // Static, so it answers without the database.
   if (req.query?.shape === "vocabulary") {
     try {
@@ -937,6 +1055,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  if (shape === "listing") {
+    if (!keyAuth) {
+      res.statusCode = 400;
+      res.json({ error: "shape=listing is only available on /v1/items" });
+      return;
+    }
+    if (keyAuth.tier === "community") {
+      res.statusCode = 403;
+      res.json({ error: "Listing requires a partner or internal key" });
+      return;
+    }
+  }
+
   // ?locale= asks for translated content; absent means source text only.
   let locale: string | null;
   try {
@@ -960,7 +1091,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (shape === "storylines") {
     try {
       const index = await getStorylineIndex(client);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+      res.setHeader("Cache-Control", EDGE_LONG_CACHE);
       res.json(index);
     } catch (err) {
       console.error("items: storyline index query failed", err);
@@ -993,7 +1124,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (shape === "set_of_works") {
     try {
       const setOfWorksIndex = await getSetOfWorksIndex(client);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+      res.setHeader("Cache-Control", EDGE_LONG_CACHE);
       res.json(setOfWorksIndex);
     } catch (err) {
       console.error("items: set_of_works index query failed", err);
@@ -1028,7 +1159,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       const shelves = await getShelves(client);
       if (locale) await translateShelves(client, shelves, locale);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+      res.setHeader("Cache-Control", EDGE_LONG_CACHE);
       res.json(shelves);
     } catch (err) {
       console.error("items: shelves query failed", err);
@@ -1041,7 +1172,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (shape === "music") {
     try {
       const buckets = await getMusicBuckets(client);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+      res.setHeader("Cache-Control", EDGE_LONG_CACHE);
       res.json(buckets);
     } catch (err) {
       console.error("items: music buckets query failed", err);
@@ -1054,7 +1185,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (shape === "heroes") {
     try {
       const heroes = await getHeroPool(client);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+      res.setHeader("Cache-Control", EDGE_LONG_CACHE);
       res.json(heroes);
     } catch (err) {
       console.error("items: hero pool query failed", err);
@@ -1100,7 +1231,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const rows = await client.query(query.text, query.params);
 
-    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300");
+    res.setHeader(
+      "Cache-Control",
+      query.manifest || shape === "facets"
+        ? EDGE_LONG_CACHE
+        : "public, max-age=60, s-maxage=300",
+    );
     res.statusCode = 200;
 
     if (query.counting) {
@@ -1145,6 +1281,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (query.correction) {
       res.json({ candidates: rows.map((row) => row.word as string) });
+      return;
+    }
+
+    if (query.listing) {
+      const page = rows as ListingRow[];
+      const last = page[page.length - 1];
+      res.json({
+        items: page.map((row) => ({
+          key: row.key,
+          updated_at: row.updated_at,
+          ...(row.removed && { removed: true }),
+        })),
+        next_cursor:
+          last && page.length === query.limit
+            ? encodeListingCursor(
+                last.updated_at,
+                last.key,
+                query.includeRemoved === true,
+              )
+            : null,
+      });
       return;
     }
 

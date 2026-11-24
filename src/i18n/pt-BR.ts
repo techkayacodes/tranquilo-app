@@ -15,11 +15,11 @@ export const ptBR: Dictionary = {
   "feed.scrollHint": "role para explorar",
 
   "intro.heading": "Um jeito mais calmo de navegar.",
-  // Portuguese treats 0 and 1 as singular ("0 acervo"), so .one covers both.
+  // Portuguese treats 0 and 1 as singular ("0 museu"), so .one covers both.
   "intro.tagline.one":
-    "Navegue com calma por {works} obras em domínio público de {count} acervo.",
+    "Navegue com calma por {works} obras em domínio público de {count} museu e mais.",
   "intro.tagline.other":
-    "Navegue com calma por {works} obras em domínio público de {count} acervos.",
+    "Navegue com calma por {works} obras em domínio público de {count} museus e mais.",
   "intro.mission.title": "Missão",
   "intro.mission.body": "Código aberto e sem anúncios.",
   "intro.mission.cta": "Participe",
@@ -67,6 +67,9 @@ export const ptBR: Dictionary = {
   "detail.cast.noDetail": "Ainda sem detalhes verificados.",
   "detail.fact.didYouKnow": "Você sabia?",
   "detail.fact.basic": "Informações básicas",
+  "detail.palette.find": "Ver mais obras em {bucket}",
+  "detail.palette.tooltip":
+    "{bucket}: clique para ver todas as obras com paleta em {bucketLower}",
   "detail.meta.artist": "Artista",
   "detail.meta.created": "Criado em",
   "detail.meta.material": "Material",
@@ -87,10 +90,13 @@ export const ptBR: Dictionary = {
   "detail.cite.failed": "Não foi possível copiar",
   "detail.print.button": "Comprar impressão",
   "detail.print.soon": "A compra abre em breve.",
-  "detail.print.price": "cerca de {price}",
-  "detail.print.priceFrom": "{price} +",
-  "detail.print.estimate": "Preços estimados, entrega incluída.",
-  "detail.print.startingPrice": "Preços iniciais, entrega não incluída.",
+  "detail.print.shipTo": "Enviar para",
+  "detail.print.priceLoading": "Buscando preço…",
+  "detail.print.priceUnavailable": "Preço indisponível",
+  "detail.print.notAvailable": "Indisponível em {country}",
+  "detail.print.deliveryIncluded": "inclui cerca de {price} de entrega",
+  "detail.print.deliveryDays": "{min}–{max} dias",
+  "detail.print.approximate": "Os preços de entrega são aproximados.",
   "detail.print.importTax":
     "O comprador é responsável pelos impostos de importação no Brasil.",
   "detail.print.showMockup": "Ver a prévia: {product}",
@@ -124,11 +130,15 @@ export const ptBR: Dictionary = {
   "search.related": "Mostrando obras relacionadas a “{concept}”",
   "search.results.one": "{count} resultado para “{query}”",
   "search.results.other": "{count} resultados para “{query}”",
+  "search.sourceLabel": "Fonte",
+  "search.allSources": "Todas as fontes",
+  "search.inSource": "em {source}",
   "search.noResults": "Nenhum resultado para “{query}”.",
   "search.didYouMean":
     "Nenhum resultado para “{query}”. Você quis dizer {suggestion}?",
 
   "filter.moreBy": "Mais por {artist}",
+  "filter.fromSource": "Obras de {source}",
   "filter.collection": "{title} ({count})",
   "collection.toast.empty": "Nada salvo ainda",
 
@@ -136,6 +146,12 @@ export const ptBR: Dictionary = {
   "share.failed": "Não foi possível copiar o link",
 
   "error.heading": "Estamos com um problema agora, mas voltaremos em breve.",
+  "error.rateLimited":
+    "Estamos recebendo muitas solicitações agora! Aguarde um ou dois minutos e atualize a página para tentar de novo.",
+  "error.rateLimitedWait.one":
+    "Estamos recebendo muitas solicitações agora! Aguarde cerca de {count} minuto e atualize a página para tentar de novo.",
+  "error.rateLimitedWait.other":
+    "Estamos recebendo muitas solicitações agora! Aguarde cerca de {count} minutos e atualize a página para tentar de novo.",
   "error.retry": "Tentar de novo",
   "error.home": "Voltar para Tranquilo",
 
@@ -252,8 +268,10 @@ export const ptBR: Dictionary = {
   "artistCard.wikidata": "Ver na Wikidata",
 
   "chips.all": "Todos",
-  "chips.storyline": "Narrativa",
   "chips.more": "Mais",
+
+  "filters.palette": "Paleta",
+  "filters.allPalettes": "Todas as paletas",
 
   "facet.category.paintings-portraits": "Pinturas e retratos",
   "facet.category.sculpture-objects": "Esculturas e objetos",

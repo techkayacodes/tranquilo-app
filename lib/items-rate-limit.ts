@@ -11,6 +11,15 @@
 import { TRANQUILO_CONFIG } from "./config.generated.ts";
 import type { QuerySql } from "./img-store.ts";
 import { clientIp } from "./img-visitor-rate-limit.ts";
+import {
+  ALERT_EMAILS_PER_HOUR,
+  flagHeavyReader,
+  heavyReaderMessage,
+  repeatedlyRefusedMessage,
+  sendOpsEmail,
+  VISITOR_DENIED_COST_MIN,
+  VOLUME_CHECK_FLOOR,
+} from "./items-abuse-alert.ts";
 import { visitorKey } from "./visitor-hash.ts";
 
 interface Limits {
@@ -43,27 +52,31 @@ interface Verdict {
   allowed: boolean;
   reason: string;
   tokens: number | null;
+  spent?: number;
+  flagged?: boolean;
 }
 
 export const ACQUIRE_SQL =
-  "INSERT INTO visitor_fetch_state (ip, tokens, capacity, refill_per_sec, last_refill, updated_at) " +
-  "VALUES ($1, $3::real - $2::real, $3::real, $4::real, now(), now()) " +
+  "INSERT INTO visitor_fetch_state (ip, tokens, capacity, refill_per_sec, last_refill, updated_at, spent) " +
+  "VALUES ($1, $3::real - $2::real, $3::real, $4::real, now(), now(), $2::bigint) " +
   "ON CONFLICT (ip) DO UPDATE SET " +
   "  tokens = LEAST(visitor_fetch_state.capacity, " +
   "    visitor_fetch_state.tokens + EXTRACT(EPOCH FROM (now() - visitor_fetch_state.last_refill)) " +
   "      * visitor_fetch_state.refill_per_sec) - $2::real, " +
   "  last_refill = now(), " +
-  "  updated_at = now() " +
+  "  updated_at = now(), " +
+  "  spent = visitor_fetch_state.spent + $2::bigint " +
   "WHERE LEAST(visitor_fetch_state.capacity, " +
   "    visitor_fetch_state.tokens + EXTRACT(EPOCH FROM (now() - visitor_fetch_state.last_refill)) " +
   "      * visitor_fetch_state.refill_per_sec) >= $2::real " +
-  "RETURNING tokens";
+  "RETURNING tokens, spent, flagged_at";
 
-type BudgetKind = "items" | "detail" | `write:${string}`;
+type BudgetKind = "items" | "detail" | "quote" | "alert" | `write:${string}`;
 
 const configured = (): Limits => TRANQUILO_CONFIG.items_visitor_rate_limit;
 const configuredDetail = (): Limits =>
   TRANQUILO_CONFIG.detail_visitor_rate_limit;
+const configuredQuote = (): Limits => TRANQUILO_CONFIG.quote_visitor_rate_limit;
 
 // One token for an aggregate answer, one per row for anything that returns
 // items.
@@ -97,9 +110,19 @@ async function acquireBudget(
       charge,
       limits.capacity,
       limits.refill_per_sec,
-    ])) as { tokens: string | number }[];
+    ])) as {
+      tokens: string | number;
+      spent?: string | number;
+      flagged_at?: unknown;
+    }[];
     if (rows.length)
-      return { allowed: true, reason: "ok", tokens: Number(rows[0].tokens) };
+      return {
+        allowed: true,
+        reason: "ok",
+        tokens: Number(rows[0].tokens),
+        spent: rows[0].spent === undefined ? undefined : Number(rows[0].spent),
+        flagged: Boolean(rows[0].flagged_at),
+      };
     return { allowed: false, reason: "rate-limited", tokens: 0 };
   } catch (_err) {
     return { allowed: true, reason: "error", tokens: null };
@@ -113,20 +136,54 @@ const RECORD_DENIAL_SQL =
   "  denied_requests = items_budget_events.denied_requests + 1, " +
   "  denied_cost = items_budget_events.denied_cost + $3, " +
   "  enforced = $4, " +
-  "  last_seen = now()";
+  "  last_seen = now() " +
+  "RETURNING denied_cost";
 
+// The day's refused total after this denial, so the caller can tell when it
+// crosses an alert line.
 export async function recordBudgetDenial(
   sql: QuerySql,
   visitor: string,
   kind: string,
   cost: number,
   enforced: boolean,
-): Promise<void> {
+): Promise<number | null> {
   try {
-    await sql.query(RECORD_DENIAL_SQL, [visitor, kind, cost, enforced]);
+    const rows = (await sql.query(RECORD_DENIAL_SQL, [
+      visitor,
+      kind,
+      cost,
+      enforced,
+    ])) as { denied_cost: string | number }[] | undefined;
+    return rows?.length ? Number(rows[0].denied_cost) : null;
   } catch (_err) {
-    // Counting is best effort; never fail the request over it.
+    return null;
   }
+}
+
+const ALERT_LIMITS: Limits = {
+  capacity: ALERT_EMAILS_PER_HOUR,
+  refill_per_sec: ALERT_EMAILS_PER_HOUR / 3600,
+  enforce: true,
+};
+
+async function raiseAlert(
+  sql: QuerySql,
+  message: { subject: string; text: string },
+): Promise<void> {
+  const budget = await acquireBudget(sql, "all", 1, ALERT_LIMITS, "alert");
+  if (!budget.allowed) return;
+  await sendOpsEmail(message.subject, message.text);
+}
+
+async function watchVolume(
+  sql: QuerySql,
+  visitor: string,
+  verdict: Verdict,
+): Promise<void> {
+  if (verdict.flagged || (verdict.spent ?? 0) < VOLUME_CHECK_FLOOR) return;
+  const reader = await flagHeavyReader(sql, visitor);
+  if (reader) await raiseAlert(sql, heavyReaderMessage(reader));
 }
 
 // True when the 429 has been sent and the caller must return. While
@@ -165,6 +222,16 @@ export async function writeRateLimitOrRespond(
   return rateLimitOrRespond(sql, req, res, 1, limits, `write:${route}`);
 }
 
+// One Gelato quote costs one token from a bucket of its own.
+export async function quoteRateLimitOrRespond(
+  sql: QuerySql | null | undefined,
+  req: RequestWithHeaders,
+  res: RateLimitResponse,
+  limits: Limits = configuredQuote(),
+): Promise<boolean> {
+  return rateLimitOrRespond(sql, req, res, 1, limits, "quote");
+}
+
 async function rateLimitOrRespond(
   sql: QuerySql | null | undefined,
   req: RequestWithHeaders,
@@ -175,8 +242,28 @@ async function rateLimitOrRespond(
 ): Promise<boolean> {
   const visitor = visitorKey(clientIp(req));
   const verdict = await acquireBudget(sql, visitor, cost, limits, kind);
-  if (verdict.allowed || !sql || !visitor) return false;
-  await recordBudgetDenial(sql, visitor, kind, cost, limits.enforce);
+  if (verdict.allowed) {
+    if (kind === "items" && sql && visitor) {
+      await watchVolume(sql, visitor, verdict);
+    }
+    return false;
+  }
+  if (!sql || !visitor) return false;
+  const deniedToday = await recordBudgetDenial(
+    sql,
+    visitor,
+    kind,
+    cost,
+    limits.enforce,
+  );
+  if (
+    kind === "items" &&
+    deniedToday !== null &&
+    deniedToday >= VISITOR_DENIED_COST_MIN &&
+    deniedToday - cost < VISITOR_DENIED_COST_MIN
+  ) {
+    await raiseAlert(sql, repeatedlyRefusedMessage(deniedToday));
+  }
   if (!limits.enforce) return false;
   const retryAfter = Math.max(
     1,

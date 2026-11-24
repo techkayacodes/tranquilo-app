@@ -13,6 +13,7 @@ import { ExportService } from "./app/ExportService";
 import { FilterState } from "./app/FilterState";
 import { ItemsApiClient } from "./app/ItemsApiClient";
 import { OverlayHistoryManager } from "./app/OverlayHistoryManager";
+import { RateLimitedError } from "./app/RateLimitedError";
 import { ScrollDepthTracker } from "./app/ScrollDepthTracker";
 import { ScrollTelemetry } from "./app/ScrollTelemetry";
 import { SearchController } from "./app/SearchController";
@@ -40,12 +41,9 @@ import {
   t,
   tHtml,
 } from "./i18n/index";
-import {
-  hasMasterSize,
-  type PrintOffer,
-  printLinkEnabled,
-  printOffersFor,
-} from "./logic/printOptions";
+import { filterQueryString, parseFilterQuery } from "./logic/filterUrl";
+import { institutionOptions } from "./logic/institutions";
+import { hasMasterSize, printLinkEnabled } from "./logic/printOptions";
 import type { ITopbarHost } from "./types/ITopbarHost";
 import type { ITranquiloDetailModalHost } from "./types/ITranquiloDetailModalHost";
 import type { ITranquiloExportModalHost } from "./types/ITranquiloExportModalHost";
@@ -57,6 +55,7 @@ import type { ITranquiloShelvesModeHost } from "./types/ITranquiloShelvesModeHos
 import type { ITranquiloStorylineModeHost } from "./types/ITranquiloStorylineModeHost";
 import type { Category, Item } from "./types/Item";
 import type { MusicBucketKey } from "./types/MusicBucket";
+import type { PrintQuoteResult } from "./types/PrintQuote";
 import type { SetOfWork, SetOfWorkIndexEntry } from "./types/SetOfWork";
 import type { HeroShelf } from "./types/Shelf";
 import type { Storyline, StorylineIndexEntry } from "./types/Storyline";
@@ -90,6 +89,7 @@ import "./components/TranquiloFeed";
 
 import "./analytics/cloudflareBeacon";
 import "./analytics/posthog";
+import { PALETTE_BUCKET_SWATCH } from "./logic/paletteSwatches";
 
 class TranquiloApp {
   async start() {
@@ -182,16 +182,31 @@ class TranquiloApp {
     function fetchFeedPage(params: Record<string, unknown>) {
       return itemsApi.fetchFeedPage(params);
     }
-    let printRegion: Promise<string | null> | null = null;
-    function itemPrintOffers(item: Item): Promise<PrintOffer[]> {
-      if (!printLinkEnabled(location.search) || !hasMasterSize(item)) {
-        return Promise.resolve([]);
+    const printQuotes = new Map<string, Promise<PrintQuoteResult>>();
+    function itemPrintQuote(item: Item, product: string, country: string) {
+      const key = `${item.source}:${item.id}|${product}|${country}`;
+      let quote = printQuotes.get(key);
+      if (!quote) {
+        quote = itemsApi.fetchPrintQuote(
+          `${item.source}:${item.id}`,
+          product,
+          country,
+        );
+        quote.catch(() => printQuotes.delete(key));
+        printQuotes.set(key, quote);
       }
-      printRegion ??= itemsApi.fetchPrintRegion().then(
-        (r) => r.region,
+      return quote;
+    }
+    let printCountry: Promise<string | null> | null = null;
+    function itemPrintCountry(item: Item): Promise<string | null> {
+      if (!printLinkEnabled(location.search) || !hasMasterSize(item)) {
+        return Promise.resolve(null);
+      }
+      printCountry ??= itemsApi.fetchPrintRegion().then(
+        (r) => r.country,
         () => null,
       );
-      return printRegion.then((region) => printOffersFor(item, region));
+      return printCountry;
     }
     function fetchFacets() {
       return itemsApi.fetchFacets();
@@ -262,6 +277,13 @@ class TranquiloApp {
     });
     const categories = ["All"].concat(
       (facets.categories ?? []).map((c) => c.value),
+    );
+    // Only buckets the catalogue has items in, from the startup facets fetch.
+    const paletteBucketOptions = (facets.palette_bucket || []).map(
+      (c: { value: string }) => ({
+        value: c.value,
+        swatch: PALETTE_BUCKET_SWATCH[c.value] || "transparent",
+      }),
     );
     const storylinesById: Record<string, StorylineIndexEntry> = {};
     storylineIndex.forEach((s) => {
@@ -373,11 +395,26 @@ class TranquiloApp {
       "tranquilo-search-bar",
     ) as TranquiloSearchBar;
     searchBarEl.facets = facets;
+    searchBarEl.setSourceOptions(institutionOptions(facets.sources));
     searchBarEl.addEventListener("search-submit", (e) => {
       runSearch((e as CustomEvent<{ query: string }>).detail.query);
     });
     searchBarEl.addEventListener("search-close-request", () => {
       requestOverlayClose(closeSearch);
+    });
+    searchBarEl.addEventListener("source-change", (e) => {
+      const { source, query } = (
+        e as CustomEvent<{ source: string | null; query: string }>
+      ).detail;
+      filterState.setSource(source);
+      trackEvent("source_filter_select", { source });
+      runSearch(query);
+    });
+    searchBarEl.addEventListener("storyline-filter-toggle", () => {
+      const on = filterState.toggleStorylineFilter();
+      trackEvent("storyline_filter_toggle", { on });
+      renderChips();
+      feedEl.render();
     });
     // Host methods below are wrapped in closures since several targets
     // (recycleWindow rebindings, createSlideShell, etc.) are assigned
@@ -405,6 +442,8 @@ class TranquiloApp {
       isCollectionKey: (entry: string) =>
         collectionStore.isCollectionKey(entry),
       getFilterState: () => filterState.snapshot(),
+      filterQueryString: () => filterQueryString(filterState.snapshot()),
+      clearFilterBanner: () => hideFilterBanner(),
       // Read-and-clear atomically, so a second render() never re-honours
       // a link already consumed.
       consumeDeepLinkSlug: () => {
@@ -469,10 +508,16 @@ class TranquiloApp {
       shareItem: (item) => {
         shareItem(item);
       },
+      openLightbox: (src, alt, item) => {
+        lightboxEl.open(src, alt, item);
+      },
       sourceLinkLabel: (item) => sourceLinkLabel(item),
       sourceLinkText: (item) => sourceLinkText(item),
       setArtistFilter: (artist) => {
         setArtistFilter(artist);
+      },
+      applyPaletteFilter: (bucket) => {
+        applyPaletteFilter(bucket);
       },
       openStorylineMode: (storylineId) => {
         storylineReturnEl = null;
@@ -493,7 +538,8 @@ class TranquiloApp {
       showToast: (msg) => {
         showToast(msg);
       },
-      printOffersFor: (item: Item) => itemPrintOffers(item),
+      printCountry: (item: Item) => itemPrintCountry(item),
+      printQuote: itemPrintQuote,
     };
     detailModalEl.app = detailModalHost;
     detailModalEl.addEventListener("storyline-handoff-restore", (e) => {
@@ -654,6 +700,7 @@ class TranquiloApp {
     const topbarHost: ITopbarHost = {
       onCategorySelect: (cat) => {
         filterState.setCategory(cat);
+        filterState.setSource(null);
         filterState.setArtist(null);
         filterState.setSearch(null);
         filterState.setConcept(null);
@@ -666,11 +713,11 @@ class TranquiloApp {
         renderChips();
         feedEl.render();
       },
-      onStorylineFilterToggle: () => {
-        const on = filterState.toggleStorylineFilter();
-        trackEvent("storyline_filter_toggle", { on });
-        renderChips();
-        feedEl.render();
+      // Unlike every handler above, this deliberately leaves
+      // category/search/concept/collection alone -- the Palette dropdown
+      // is an independent, composable filter, not another exclusive mode.
+      onPaletteSelect: (bucket: string | null) => {
+        applyPaletteFilter(bucket);
       },
       onMusicToggle: () => {
         const on = musicToggleEl.toggle();
@@ -691,6 +738,7 @@ class TranquiloApp {
         showCollectionView();
       },
       onFilterBannerClear: () => {
+        filterState.setSource(null);
         filterState.setArtist(null);
         filterState.setSearch(null);
         filterState.setConcept(null);
@@ -860,8 +908,23 @@ class TranquiloApp {
       updateCollectionToggle();
       topbarEl.setChips(categories, filterState.getCategory(), {
         collectionActive: filterState.getCollectionFilter(),
-        storylineActive: filterState.getStorylineFilter(),
+        paletteBuckets: paletteBucketOptions,
+        activePaletteBucket: filterState.getPaletteBucket(),
       });
+      // Lives in the search panel now, not the chips row -- see
+      // TranquiloSearchBar.ts's header comment for why. renderChips()
+      // already runs after every filter-state change in this file, so
+      // piggybacking the checkbox's sync here (rather than a second
+      // call site) keeps it from ever drifting out of sync with reality.
+      searchBarEl.setStorylineActive(filterState.getStorylineFilter());
+      searchBarEl.setSourceActive(filterState.getSource());
+    }
+
+    function applyPaletteFilter(bucket: string | null) {
+      filterState.setPaletteBucket(bucket);
+      trackEvent("palette_filter_select", { bucket });
+      renderChips();
+      feedEl.render();
     }
 
     function buildIntroSlideForFeed() {
@@ -991,6 +1054,7 @@ class TranquiloApp {
     }
 
     function setArtistFilter(artist: any) {
+      filterState.setSource(null);
       filterState.setArtist(artist);
       filterState.setSearch(null);
       filterState.setConcept(null);
@@ -1008,6 +1072,7 @@ class TranquiloApp {
     }
 
     function showCollectionView() {
+      filterState.setSource(null);
       filterState.setArtist(null);
       filterState.setSearch(null);
       filterState.setConcept(null);
@@ -1069,6 +1134,7 @@ class TranquiloApp {
       setActiveCollectionFilter: (v: any) => {
         filterState.setCollectionFilter(v);
       },
+      getActiveSource: () => filterState.getSource(),
       getSearchResultCount: () => searchResultCount,
       setSearchResultCount: (v: any) => {
         searchResultCount = v;
@@ -1077,6 +1143,7 @@ class TranquiloApp {
 
       clearSuggestions: () => searchBarEl.clearSuggestions(),
       setResultsLine: (html: any) => searchBarEl.setResultsLine(html),
+      setSearchLoading: (loading: boolean) => searchBarEl.setLoading(loading),
       openSearchBar: (prefill: any) => searchBarEl.open(prefill),
       closeSearchBar: () => searchBarEl.close(),
       pushHistory: (q: any) => searchBarEl.pushHistory(q),
@@ -1164,6 +1231,10 @@ class TranquiloApp {
     let hintHidden = false;
     function refreshScrollHint() {
       if (hintHidden) return;
+      if (feedEl.querySelector(".error-state")) {
+        scrollHint.classList.add("hidden");
+        return;
+      }
       const roomBelow =
         feedEl.scrollHeight - feedEl.clientHeight - feedEl.scrollTop;
       scrollHint.classList.toggle("hidden", roomBelow <= 40);
@@ -1227,9 +1298,49 @@ class TranquiloApp {
     if (hadDeepLinkArtwork) {
       pendingDeepLinkSlug = initialSlug;
     }
-    feedEl.render(
-      hadDeepLinkArtwork ? () => openDeepLinkedArtwork(initialSlug) : undefined,
-    );
+    // Filters are only restored on the bare feed URL: every other path
+    // (artwork, storyline, shelf, discover) already names what to show.
+    // A category landing page names exactly one filter.
+    const categoryPage = slugCodec.categoryFromLocation();
+    const sharedFilters = /^\/(index\.html)?$/.test(location.pathname)
+      ? parseFilterQuery(location.search, {
+          categories,
+          sources: (facets.sources ?? []).map((s) => s.value),
+          paletteBuckets: paletteBucketOptions.map((o) => o.value),
+        })
+      : categoryPage && categories.includes(categoryPage)
+        ? {
+            query: null,
+            artist: null,
+            category: categoryPage,
+            source: null,
+            paletteBucket: null,
+            storylineFilter: false,
+          }
+        : null;
+    if (sharedFilters) {
+      filterState.setCategory(sharedFilters.category);
+      filterState.setSource(sharedFilters.source);
+      filterState.setPaletteBucket(sharedFilters.paletteBucket);
+      if (sharedFilters.storylineFilter) filterState.toggleStorylineFilter();
+    }
+    const restoresSearch =
+      sharedFilters !== null &&
+      (sharedFilters.query !== null || sharedFilters.source !== null);
+    if (restoresSearch) {
+      renderChips();
+      runSearch(sharedFilters.query ?? "");
+    } else if (sharedFilters?.artist) {
+      renderChips();
+      setArtistFilter(sharedFilters.artist);
+    } else {
+      renderChips();
+      feedEl.render(
+        hadDeepLinkArtwork
+          ? () => openDeepLinkedArtwork(initialSlug)
+          : undefined,
+      );
+    }
 
     // Opens after the feed renders (not instead of), so closing the
     // storyline leaves a real feed behind rather than a blank page.
@@ -1296,9 +1407,16 @@ new TranquiloApp().start().catch((err: any) => {
   // Not feedEl -- that's declared inside start()'s own scope.
   const feedEl = document.getElementById("feed") as any;
   feedEl.innerHTML = "";
+  document.getElementById("scrollHint")?.classList.add("hidden");
   feedEl.appendChild(
     renderErrorState({
-      detail: err?.message || "Tranquilo failed to load.",
+      detail:
+        err instanceof RateLimitedError
+          ? "429 — Too many requests"
+          : err?.message || "Tranquilo failed to load.",
+      rateLimited: err instanceof RateLimitedError,
+      retryAfterSeconds:
+        err instanceof RateLimitedError ? err.retryAfterSeconds : null,
       onRetry: () => location.reload(),
     }),
   );

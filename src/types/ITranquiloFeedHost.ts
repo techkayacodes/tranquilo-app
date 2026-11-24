@@ -15,9 +15,19 @@ export interface FeedFilterState {
   category: string;
   artist: string | null;
   search: string | null;
-  concept: { label: string; filter: Record<string, unknown> } | null;
+  concept: {
+    label: string;
+    filter: Record<string, unknown>;
+    query?: string;
+  } | null;
   collectionFilter: boolean;
   storylineFilter: boolean;
+  // The Palette dropdown's own selection, or one set by tapping a
+  // per-item palette swatch -- composes with whichever mode above is
+  // active, merged into the ordinary feed's params.
+  paletteBucket: string | null;
+  // The search panel's institution dropdown; same composition as paletteBucket.
+  source: string | null;
 }
 
 export interface ITranquiloFeedHost {
@@ -54,6 +64,10 @@ export interface ITranquiloFeedHost {
 
   // ---- Which mode is active right now.
   getFilterState(): FeedFilterState;
+  // Removes the filter banner and artist card, e.g. when results failed to load.
+  clearFilterBanner(): void;
+  // "?q=sky&source=met"-style string for the active filters, "" when none.
+  filterQueryString(): string;
   // Read-and-clear atomically so a second render() never re-honours a
   // link already consumed.
   consumeDeepLinkSlug(): string | null;

@@ -432,7 +432,7 @@ async function alertOnce(
   if (alertedConditions[key] && now - alertedConditions[key] < ALERT_REPEAT_MS)
     return;
   alertedConditions[key] = now;
-  console.error(`img proxy: ${message}`, extra || "");
+  console.error("img proxy: %s", message, extra || "");
   try {
     const err = new Error(`img proxy: ${message}`);
     err.name = "ImgProxyDegraded";
@@ -819,7 +819,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const storeResult = verdict.admit;
 
-    // Is this source fetchable right now? A standing hold, an active
+    // Is this source fetchable right now? A held source, an active
     // Retry-After cooldown, or an exhausted budget all mean: don't
     // fetch it ourselves.
     let budget = await guard.acquireFetchToken(sqlClient, source);
@@ -898,7 +898,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           `429:${hostOf(originUrl)}`,
           `rate-limited (429) by ${hostOf(originUrl)} -- pausing server-side fetches ` +
             `to that host for ${cooldown}s. Other hosts for this source are ` +
-            `unaffected. This is the failure mode that produced the Wikimedia rate-limit hold.`,
+            `unaffected. Repeated 429s risk a source block.`,
           {
             source: source,
             host: hostOf(originUrl),
@@ -1068,7 +1068,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await admission.markStored(sqlClient, cacheKey, outBuf.length);
     await guard.releaseFetch(sqlClient, cacheKey);
   } catch (err) {
-    console.error(`img proxy: failed for ${source}:${id}:${tier}`, err);
+    console.error("img proxy: failed for %s:%s:%s", source, id, tier, err);
     await sentry.reportError(err);
     res.statusCode = 502;
     res.json({ error: "Image unavailable" });

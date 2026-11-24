@@ -19,7 +19,12 @@
 // data-driven and only changes because app.ts called render();
 // index.html's "feed-loading" placeholder is left alone until then.
 
+import { RateLimitedError } from "../app/RateLimitedError";
+import { TRANQUILO_CONFIG } from "../data/config.generated";
+import { renderErrorState } from "../errorState";
+import { loadOpening } from "../feed/opening";
 import type { Pager } from "../feed/recycleWindow";
+import { sessionStart } from "../feed/sessionStart";
 import { HERO_COUNT, pickHeroes } from "../logic/logic";
 import type { HeroPoolEntry } from "../types/HeroPoolEntry";
 import type {
@@ -180,7 +185,11 @@ export class TranquiloFeed extends HTMLElement {
   private allModeStart: number | null = null;
 
   private getAllModeStart(): number {
-    if (this.allModeStart === null) this.allModeStart = Math.random();
+    if (this.allModeStart === null)
+      this.allModeStart = sessionStart(
+        Math.random(),
+        TRANQUILO_CONFIG.feed.start_buckets,
+      );
     return this.allModeStart;
   }
 
@@ -218,6 +227,14 @@ export class TranquiloFeed extends HTMLElement {
     const host = this.requireApp();
     host.resetScrollDepthTracking();
     host.resetRecycleWindow();
+    // Dims rather than snapping straight to a blank feed for the
+    // duration of whatever async work this mode needs -- removed in
+    // markFeedSettled(), the single completion choke point every branch
+    // below (success, empty-collection, and the error path) already
+    // funnels through. A pure CSS opacity transition: doesn't touch
+    // slideRecords or DOM structure, so none of the record-index/DOM-
+    // index invariants above are at risk.
+    this.classList.add("feed-transitioning");
     this.innerHTML = "";
     this.showLoadingSkeleton();
     this.feedPager = null;
@@ -277,7 +294,11 @@ export class TranquiloFeed extends HTMLElement {
         // since a returning visitor is returning whether or not they
         // closed the tab -- then memoized for this page load, so a later
         // category round-trip doesn't read the flag markFeedSeen() just set.
-        if (!state.storylineFilter && this.showHeroesThisSession())
+        if (
+          !state.storylineFilter &&
+          !state.source &&
+          this.showHeroesThisSession()
+        )
           leadingItems = [];
       } else {
         params.category = state.category;
@@ -287,11 +308,25 @@ export class TranquiloFeed extends HTMLElement {
     if (state.storylineFilter) {
       params.has_storyline = "1";
     }
+    // The Palette dropdown/a per-item swatch tap -- composes with
+    // whichever ordinary-feed mode is active above (search, a plain
+    // concept, category browsing, artist, a deep link). Excluded from
+    // fixedItems mode (collection), which doesn't read `params` at all.
+    if (!fixedItems && state.paletteBucket) {
+      params.palette_bucket = state.paletteBucket;
+    }
+    if (!fixedItems && state.source) {
+      params.source = state.source;
+    }
 
     // Derived, never set by a branch. An intro is skipped only when one
     // exists and the visitor asked for something specific.
     const skipIntroToFirstItem =
-      introAdded && (state.category !== "All" || state.storylineFilter);
+      introAdded &&
+      (state.category !== "All" ||
+        state.storylineFilter ||
+        !!state.paletteBucket ||
+        !!state.source);
 
     // Everything below settles the first screenful, then hands off to the
     // pager -- one promise chain so every mode finishes through the same
@@ -347,12 +382,13 @@ export class TranquiloFeed extends HTMLElement {
       const pager = host.createPager(params, checkCategory, heroExclusions);
       if (state.category === "All") pager.start = this.getAllModeStart();
       this.feedPager = pager;
-      firstBatch = (leadingItems ? this.fetchHeroItems() : Promise.resolve([]))
-        .then((heroes) => {
-          leadingItems = heroes;
-          return host.loadNextPage(pager);
-        })
-        .then((page) => host.fillFirstScreen(pager, page));
+      firstBatch = loadOpening(
+        leadingItems ? () => this.fetchHeroItems() : null,
+        () => host.loadNextPage(pager),
+      ).then(({ heroes, page }) => {
+        if (leadingItems) leadingItems = heroes;
+        return host.fillFirstScreen(pager, page);
+      });
     }
 
     firstBatch
@@ -367,6 +403,12 @@ export class TranquiloFeed extends HTMLElement {
         // Only once something is genuinely on screen -- marking it at
         // render start would burn the first impression on a failed load.
         if (initial.length) markFeedSeen();
+
+        if (!initial.length && this.feedPager?.rateLimited) {
+          this.showRateLimited(this.feedPager.rateLimited.retryAfterSeconds);
+          this.markFeedSettled(onSettled);
+          return;
+        }
 
         if (!initial.length && state.collectionFilter) {
           const emptyEl = host.buildEmptyCollectionSlide();
@@ -403,17 +445,53 @@ export class TranquiloFeed extends HTMLElement {
         // skeleton, which would otherwise shimmer forever over nothing.
         console.error("items: feed render failed", err);
         this.clearLoadingSkeleton();
+        if (
+          err instanceof RateLimitedError &&
+          renderToken === this.activeRenderToken
+        ) {
+          this.showRateLimited(err.retryAfterSeconds);
+        }
         this.markFeedSettled(onSettled);
       });
   }
 
+  // Replaces whatever the failed render left behind; the next render()
+  // clears this like any other content.
+  private showRateLimited(retryAfterSeconds: number | null): void {
+    this.innerHTML = "";
+    const host = this.requireApp();
+    host.resetRecycleWindow();
+    // The search banner and artist card describe results that never loaded.
+    host.clearFilterBanner();
+    this.appendChild(
+      renderErrorState({
+        detail: "429 — Too many requests",
+        rateLimited: true,
+        retryAfterSeconds,
+        onRetry: () => location.reload(),
+      }),
+    );
+  }
+
   private markFeedSettled(onSettled?: () => void): void {
+    this.classList.remove("feed-transitioning");
     this.feedRenderCount++;
     window.__tranquiloFeedRenders = this.feedRenderCount;
     // For page chrome that depends on how much feed there is (the scroll
     // cue in app.ts), which can only be judged once a render has landed.
     this.dispatchEvent(new Event("feed-settled"));
+    this.syncUrlForFilterChange();
     if (onSettled) onSettled();
+  }
+
+  // A filter change re-renders without scrolling, so the scroll-driven
+  // sync never fires. Limited to filters being applied or just cleared:
+  // syncing every settle would rewrite storyline, shelf and discover URLs.
+  private syncUrlForFilterChange(): void {
+    const wasFiltered = this.lastSyncedUrl?.startsWith("/?") ?? false;
+    if (wasFiltered || this.requireApp().filterQueryString()) {
+      this.scheduleUrlSync();
+    }
   }
 
   // Shown the instant render() clears the feed (any filter/category/search
@@ -527,14 +605,17 @@ export class TranquiloFeed extends HTMLElement {
   // Keeps the address bar pointing at whatever is on screen, so the URL is
   // a copyable reference to a specific artwork. replaceState, not
   // pushState: pushing an entry per slide would turn the back button into
-  // a slide-by-slide rewind.
+  // a slide-by-slide rewind. While filters are active the URL names the
+  // filters instead, so copying it shares the results, not one artwork.
   private syncUrlToActiveSlide(): void {
     const host = this.requireApp();
     if (!this.slideRecords.length) return;
     const rec = this.slideRecords[host.activeSlideIndex()];
+    const filters = host.filterQueryString();
     // The intro slide has no item; that is the top of the feed, which is "/".
-    const url =
-      rec?.item != null
+    const url = filters
+      ? `/${filters}`
+      : rec?.item != null
         ? `/v/${rec.item.source || "met"}-${encodeSlugId(rec.item.source || "met", rec.item.id)}`
         : "/";
     if (url === this.lastSyncedUrl) return;

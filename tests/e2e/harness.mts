@@ -1,7 +1,7 @@
 // Shared setup for the functional suite. Everything outbound is stubbed.
 // /img/** is not optional: unstubbed, a full run would pull hundreds of
 // images through the proxy to Commons, the Met, Cleveland and Smithsonian
-// on every CI run, and Commons is under a standing rate-limit hold.
+// on every CI run.
 // /api/track is not optional either: unstubbed, every run would write fake
 // events into the real events table and corrupt the numbers decisions are
 // made from. /api/items is served from a captured fixture so runs are
@@ -260,6 +260,11 @@ export async function stubBackend(
     route.fulfill({ status: 200, contentType: "text/html", body: appHtml }),
   );
 
+  // /category/{slug} too, same rewrite into the same handler.
+  await page.route(/\/category\/[^/]+$/, (route: Route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: appHtml }),
+  );
+
   // The stub emulates the endpoint's shapes, not just its data: the client
   // makes three different requests against /api/items, each structurally
   // different, so a stub answering all three with the same array would
@@ -312,6 +317,7 @@ export async function stubBackend(
     "cast_context",
     "twist_story",
     "twist_source_url",
+    "palette_buckets",
   ];
   const bulk = (item: Record<string, unknown>) =>
     Object.fromEntries(
@@ -414,6 +420,7 @@ export async function stubBackend(
           cast_context: found.cast_context ?? null,
           twist_story: found.twist_story ?? null,
           twist_source_url: found.twist_source_url ?? null,
+          palette_buckets: found.palette_buckets ?? [],
         },
       });
     }
@@ -508,6 +515,21 @@ export async function stubBackend(
           )
           .map(([value, count]) => ({ value, count }));
       };
+      // Array-valued, unlike every other field above -- one tally
+      // entry per distinct bucket an item's palette_buckets carries, an
+      // item counted once per value it has (mirrors the real backend's
+      // unnest(palette_buckets) groupArray(), not a plain tally()).
+      const tallyArray = (field: string) => {
+        const counts = new Map<string, number>();
+        for (const i of keyed) {
+          const values = i[field];
+          if (!Array.isArray(values)) continue;
+          for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
+        }
+        return [...counts.entries()]
+          .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(b[0]))
+          .map(([value, count]) => ({ value, count }));
+      };
       return json({
         categories: tally("category"),
         sources: tally("source"),
@@ -516,6 +538,7 @@ export async function stubBackend(
         era: tally("timeframe", 10),
         type: tally("media_type", 10),
         color: tally("palette", 10),
+        palette_bucket: tallyArray("palette_buckets"),
         total: keyed.length,
       });
     }
@@ -645,6 +668,18 @@ export async function stubBackend(
     if (artist) rows = rows.filter((i) => i.artist === artist);
     if (url.searchParams.get("has_storyline") === "1") {
       rows = rows.filter((i) => i.storyline_ids && i.storyline_ids.length > 0);
+    }
+    // Array-contains, same as the real palette_buckets @>
+    // ARRAY[...] filter -- composes with every other filter above on the
+    // ordinary feed (the Palette dropdown, or a per-item swatch tap when
+    // no vibe search is active).
+    const paletteBucket = url.searchParams.get("palette_bucket");
+    if (paletteBucket) {
+      rows = rows.filter(
+        (i) =>
+          Array.isArray(i.palette_buckets) &&
+          i.palette_buckets.includes(paletteBucket),
+      );
     }
 
     // The shuffle-ordered feed page: seek past the cursor (or the session's
@@ -844,6 +879,16 @@ export async function gotoDiscover(page: Page) {
   return page.locator("#shelvesMode");
 }
 
+// Cold load of /category/{slug}; waits for the feed to render.
+export async function gotoCategory(page: Page, slug: string) {
+  await stubBackend(page);
+  await page.goto(`/category/${encodeURIComponent(slug)}`);
+  await page.waitForFunction(
+    () => document.querySelectorAll("#feed .slide").length > 1,
+  );
+  return page.locator("#feed");
+}
+
 // Cold load of /shelf/{id}; waits for feed, then overlay.
 export async function gotoShelf(page: Page, id: string) {
   await stubBackend(page);
@@ -983,7 +1028,7 @@ export function hydratedCount(page: Page) {
 // Makes the image stub return 503 for requests matching `predicate(url)`.
 // Deliberately a switch on the existing stub rather than removing it: an
 // unstubbed run would pull hundreds of images through the proxy on every
-// CI run against Commons's standing rate-limit hold, and a local 503 is a
+// CI run, and a local 503 is a
 // more reproducible simulation of a failure than a real outage anyway.
 // Call before gotoFeed(), since slides start loading immediately.
 export function failImages(page: Page, predicate: (url: string) => boolean) {
